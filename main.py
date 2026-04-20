@@ -321,6 +321,11 @@ if __name__ == "__main__":
         eval.save_keyframes(
             save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
         )
+        if config.get("gaussian_splat", {}).get("enabled", False):
+            from mast3r_slam.gaussian_splat import train_gaussian_splat
+            train_gaussian_splat(
+                keyframes, K, save_dir, seq_name, config["use_calib"], config["gaussian_splat"]
+            )
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")
         savedir.mkdir(exist_ok=True, parents=True)

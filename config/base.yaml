@@ -56,3 +56,26 @@ retrieval:
 reloc:
   min_match_frac: 0.3
   strict: True
+
+gaussian_splat:
+  enabled: false
+  # Confidence gate for Gaussian initialisation (0–1).
+  # Raise to create fewer Gaussians; lower for denser coverage.
+  c_conf_threshold: 0.5
+  # Hard cap on total Gaussians — primary guard against memory blowup.
+  max_gaussians: 2000000
+  # Training
+  n_iters: 10000
+  # Per-parameter learning rates
+  lr_means: 1.6e-4
+  lr_opacity: 5.0e-2
+  lr_scales: 5.0e-3
+  lr_quats: 1.0e-3
+  lr_sh: 2.5e-3
+  # Adaptive density control
+  densify_from_iter: 500
+  densify_until_iter: 5000
+  densify_interval: 100
+  opacity_reset_interval: 3000
+  prune_opacity_thresh: 0.005
+  grad_thresh: 2.0e-4

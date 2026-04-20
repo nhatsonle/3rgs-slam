@@ -1,0 +1,21 @@
+inherit: "config/base.yaml"
+
+dataset:
+  subsample: 10   # ~120 frames from the 1207-frame video — fast PoC run
+
+gaussian_splat:
+  enabled: true
+  c_conf_threshold: 0.5
+  max_gaussians: 500000
+  n_iters: 3000
+  lr_means: 1.6e-4
+  lr_opacity: 5.0e-2
+  lr_scales: 5.0e-3
+  lr_quats: 1.0e-3
+  lr_sh: 2.5e-3
+  densify_from_iter: 300
+  densify_until_iter: 2000
+  densify_interval: 100
+  opacity_reset_interval: 1000
+  prune_opacity_thresh: 0.005
+  grad_thresh: 2.0e-4
