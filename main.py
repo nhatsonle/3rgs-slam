@@ -229,6 +229,7 @@ if __name__ == "__main__":
     fps_timer = time.time()
 
     frames = []
+    realtime_poses = []
 
     while True:
         mode = states.get_mode()
@@ -270,9 +271,11 @@ if __name__ == "__main__":
             states.queue_global_optimization(len(keyframes) - 1)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame)
+            realtime_poses.append(frame.T_WC.data.detach().cpu().clone())
             i += 1
             continue
 
+        add_new_kf = False
         if mode == Mode.TRACKING:
             add_new_kf, match_info, try_reloc = tracker.track(frame)
             if try_reloc:
@@ -293,6 +296,8 @@ if __name__ == "__main__":
 
         else:
             raise Exception("Invalid mode")
+
+        realtime_poses.append(frame.T_WC.data.detach().cpu().clone())
 
         if add_new_kf:
             keyframes.append(frame)
@@ -317,6 +322,8 @@ if __name__ == "__main__":
             f"{seq_name}.ply",
             keyframes,
             last_msg.C_conf_threshold,
+            realtime_poses=realtime_poses,
+            current_pose=realtime_poses[-1] if realtime_poses else None,
         )
         eval.save_keyframes(
             save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
