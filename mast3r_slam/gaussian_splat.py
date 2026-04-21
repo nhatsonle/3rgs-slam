@@ -52,6 +52,7 @@ def extract_gaussians(
     all_means, all_sh_dc, all_log_scales = [], [], []
     all_quats, all_opacity = [], []
     all_viewmats, all_gt_images, all_Ks = [], [], []
+    all_depth_maps, all_conf_maps = [], []
 
     n_kf = len(keyframes)
     print(f"[GS] Extracting from {n_kf} keyframes (confidence threshold={threshold})...")
@@ -106,6 +107,10 @@ def extract_gaussians(
         # ── Camera pose for renderer (world→cam 4×4)
         viewmat = _sim3_to_w2c(kf.T_WC)                        # (4, 4)
 
+        # ── Per-pixel GT depth (camera z) and confidence — used for depth loss
+        depth_gt = X[:, 2].reshape(H_img, W_img).clamp(min=1e-3)   # (H, W)
+        conf_map = conf_norm.reshape(H_img, W_img)                  # (H, W) in (0,1)
+
         all_means.append(means_world[valid])
         all_sh_dc.append(sh_dc[valid])
         all_log_scales.append(log_scales[valid])
@@ -113,6 +118,8 @@ def extract_gaussians(
         all_opacity.append(opacity_logit[valid])
         all_viewmats.append(viewmat.to(device))
         all_gt_images.append(kf.uimg.to(device))                # (H, W, 3)
+        all_depth_maps.append(depth_gt.to(device))              # (H, W)
+        all_conf_maps.append(conf_map.to(device))               # (H, W)
         if use_calib and kf.K is not None:
             all_Ks.append(kf.K)
 
@@ -127,6 +134,8 @@ def extract_gaussians(
         "opacity":    torch.cat(all_opacity,    dim=0).requires_grad_(True),
         "viewmats":   torch.stack(all_viewmats),                # (N_kf, 4, 4)
         "gt_images":  all_gt_images,
+        "depth_maps": all_depth_maps,                           # list[(H, W)]
+        "conf_maps":  all_conf_maps,                            # list[(H, W)]
         "Ks":         torch.stack(all_Ks) if all_Ks else None,
     }
     return result
@@ -210,6 +219,9 @@ def train_gaussian_splat(
     opacity_reset_int  = cfg.get("opacity_reset_interval",   3_000)
     prune_thresh       = cfg.get("prune_opacity_thresh",      0.005)
     grad_thresh        = cfg.get("grad_thresh",               2e-4)
+    lambda_ssim        = cfg.get("lambda_ssim",               0.2)
+    lambda_depth       = cfg.get("lambda_depth",              0.1)
+    depth_min_conf     = cfg.get("depth_min_conf",            0.3)
 
     print(f"[GS] Training {data['means'].shape[0]:,} Gaussians for {n_iters} iters ...")
     print(f"[GS] Image size: {H_img}×{W_img}  |  Keyframes: {n_kf}")
@@ -226,31 +238,45 @@ def train_gaussian_splat(
         gt      = data["gt_images"][kf_idx]                     # (H, W, 3)
         K_i     = Ks_render[kf_idx].unsqueeze(0)               # (1, 3, 3)
 
-        # ── Rasterise (absgrad=True so we can accumulate 2D grad for densify)
-        # packed=False: ensures render_colors always has grad_fn even if
-        # no Gaussians project onto the image (packed=True returns bare zeros).
+        # ── Rasterise RGB + camera-z depth in one pass
+        # render_mode="RGB+D": output shape (1, H, W, 4); last channel = depth (m)
+        # packed=False: ensures grad_fn even when few Gaussians project onto image.
         render_colors, render_alphas, meta = rasterization(
-            means     = data["means"],
-            quats     = data["quats"],                          # wxyz
-            scales    = torch.exp(data["log_scales"]),
-            opacities = torch.sigmoid(data["opacity"]),         # (N,)
-            colors    = data["sh_dc"].unsqueeze(1),             # (N, 1, 3) DC SH
-            viewmats  = viewmat,
-            Ks        = K_i,
-            width     = W_img,
-            height    = H_img,
-            sh_degree = 0,
-            absgrad   = True,
-            packed    = False,
+            means       = data["means"],
+            quats       = data["quats"],                        # wxyz
+            scales      = torch.exp(data["log_scales"]),
+            opacities   = torch.sigmoid(data["opacity"]),       # (N,)
+            colors      = data["sh_dc"].unsqueeze(1),           # (N, 1, 3) DC SH
+            viewmats    = viewmat,
+            Ks          = K_i,
+            width       = W_img,
+            height      = H_img,
+            sh_degree   = 0,
+            render_mode = "RGB+D",
+            absgrad     = True,
+            packed      = False,
         )
-        render = render_colors[0].clamp(0.0, 1.0)              # (H, W, 3)
+        render      = render_colors[0, :, :, :3].clamp(0.0, 1.0)  # (H, W, 3)
+        render_dep  = render_colors[0, :, :, 3]                    # (H, W) camera z
 
         # Guard: skip frames where no Gaussians were visible
         if render.grad_fn is None:
             continue
 
-        # ── L1 photometric loss
-        loss = torch.abs(render - gt).mean()
+        # ── Combined loss: (1-λ)*L1 + λ*D-SSIM + λ_depth*L_depth
+        l_l1     = (render - gt).abs().mean()
+        l_d_ssim = (1.0 - _ssim(render, gt)) / 2.0
+        loss     = (1.0 - lambda_ssim) * l_l1 + lambda_ssim * l_d_ssim
+
+        if lambda_depth > 0.0:
+            gt_dep   = data["depth_maps"][kf_idx]               # (H, W) MASt3R depth
+            conf_w   = data["conf_maps"][kf_idx]                # (H, W) confidence
+            valid    = (gt_dep > 1e-3) & (render_dep > 1e-3) & (conf_w > depth_min_conf)
+            if valid.any():
+                l_depth = (conf_w[valid] * (
+                    render_dep[valid].log() - gt_dep[valid].log()
+                ).abs()).mean()
+                loss = loss + lambda_depth * l_depth
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -296,8 +322,14 @@ def train_gaussian_splat(
             absgrad_accum.zero_()
 
         if it % 500 == 0:
+            with torch.no_grad():
+                psnr_val = _psnr(render.detach(), gt)
+                ssim_val = _ssim(render.detach(), gt).item()
             n_gs = data["means"].shape[0]
-            print(f"[GS] iter {it:5d}/{n_iters} | loss {loss.item():.4f} | N={n_gs:,}")
+            print(
+                f"[GS] iter {it:5d}/{n_iters} | loss {loss.item():.4f} | "
+                f"PSNR {psnr_val:.2f} dB | SSIM {ssim_val:.4f} | N={n_gs:,}"
+            )
 
     out_path = save_dir / f"{seq_name}_gs.ply"
     _save_splat(out_path, data)
@@ -305,6 +337,47 @@ def train_gaussian_splat(
 
 
 # ── 3. Helpers ─────────────────────────────────────────────────────────────────
+
+def _psnr(render: torch.Tensor, gt: torch.Tensor) -> float:
+    """Peak Signal-to-Noise Ratio in dB. Inputs: (H,W,3) float in [0,1]."""
+    mse = (render - gt).pow(2).mean().clamp(min=1e-10)
+    return -10.0 * math.log10(mse.item())
+
+
+def _ssim(render: torch.Tensor, gt: torch.Tensor, window_size: int = 11) -> float:
+    """Structural Similarity Index (mean over spatial map). Inputs: (H,W,3)."""
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+
+    # Build 1-D Gaussian kernel, expand to 2-D separable conv
+    sigma = 1.5
+    coords = torch.arange(window_size, dtype=torch.float32, device=render.device)
+    coords -= window_size // 2
+    kernel_1d = torch.exp(-coords.pow(2) / (2 * sigma ** 2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]          # (W, W)
+    kernel = kernel_2d.expand(3, 1, window_size, window_size)    # (3, 1, W, W)
+
+    pad = window_size // 2
+
+    def _filt(x):
+        # x: (H, W, 3) → (1, 3, H, W)
+        x_ = x.permute(2, 0, 1).unsqueeze(0)
+        return F.conv2d(x_, kernel, padding=pad, groups=3).squeeze(0).permute(1, 2, 0)
+
+    mu_x   = _filt(render)
+    mu_y   = _filt(gt)
+    mu_xx  = _filt(render * render)
+    mu_yy  = _filt(gt    * gt)
+    mu_xy  = _filt(render * gt)
+
+    sig_x  = mu_xx - mu_x * mu_x
+    sig_y  = mu_yy - mu_y * mu_y
+    sig_xy = mu_xy - mu_x * mu_y
+
+    num = (2 * mu_x * mu_y + C1) * (2 * sig_xy + C2)
+    den = (mu_x.pow(2) + mu_y.pow(2) + C1) * (sig_x + sig_y + C2)
+    return (num / den.clamp(min=1e-10)).mean()
+
 
 def _prune_mask(data: dict, threshold: float = 0.005) -> torch.Tensor:
     """Return bool mask of Gaussians to prune (True = prune).

@@ -7,7 +7,7 @@ gaussian_splat:
   enabled: true
   c_conf_threshold: 0.5
   max_gaussians: 500000
-  n_iters: 3000
+  n_iters: 10000
   lr_means: 1.6e-4
   lr_opacity: 5.0e-2
   lr_scales: 5.0e-3
@@ -19,3 +19,6 @@ gaussian_splat:
   opacity_reset_interval: 1000
   prune_opacity_thresh: 0.005
   grad_thresh: 2.0e-4
+  lambda_ssim: 0.2
+  lambda_depth: 0.1
+  depth_min_conf: 0.3

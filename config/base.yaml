@@ -79,3 +79,7 @@ gaussian_splat:
   opacity_reset_interval: 3000
   prune_opacity_thresh: 0.005
   grad_thresh: 2.0e-4
+  # Loss weights
+  lambda_ssim: 0.2       # weight of D-SSIM term; 0 = pure L1
+  lambda_depth: 0.1      # weight of log-depth loss; 0 = disabled
+  depth_min_conf: 0.3    # ignore depth loss where MASt3R confidence is below this
