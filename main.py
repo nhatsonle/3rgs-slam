@@ -25,6 +25,39 @@ from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
 
 
+def _blur_score(uimg: torch.Tensor) -> float:
+    """Laplacian variance of image — lower = more blurry."""
+    gray = uimg.float().mean(dim=-1)          # (H, W), CPU
+    lap_k = torch.tensor(
+        [[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]
+    ).view(1, 1, 3, 3)
+    lap = torch.nn.functional.conv2d(
+        gray.unsqueeze(0).unsqueeze(0), lap_k, padding=1
+    )
+    return float(lap.var())
+
+
+def _try_enqueue_aux(frame, age: int, last_kf_t, queue, cfg_gs: dict) -> None:
+    """Score a non-KF frame and enqueue it for GS aux supervision if it passes."""
+    if age > cfg_gs.get("aux_max_age", 8):
+        return
+    if _blur_score(frame.uimg) < cfg_gs.get("aux_blur_thresh", 50.0):
+        return
+    if last_kf_t is not None:
+        t = frame.T_WC.matrix()[0, :3, 3].detach().cpu()
+        if float((t - last_kf_t).norm()) < cfg_gs.get("aux_novelty_min", 0.05):
+            return
+    weight = cfg_gs.get("aux_decay", 0.95) ** age
+    try:
+        queue.put_nowait({
+            "uimg":      frame.uimg.cpu().float(),
+            "sim3_data": frame.T_WC.data.detach().cpu(),
+            "weight":    weight,
+        })
+    except Exception:
+        pass  # queue full — drop frame silently, never block main thread
+
+
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
     # we are adding and then removing from the keyframe, so we need to be careful.
     # The lock slows viz down but safer this way...
@@ -71,12 +104,22 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         return successful_loop_closure
 
 
-def run_backend(cfg, model, states, keyframes, K):
+def run_backend(cfg, model, states, keyframes, K,
+                gs_save_dir=None, gs_seq_name=None, nonkf_queue=None):
     set_global_config(cfg)
 
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
     retrieval_database = load_retriever(model)
+
+    # Online Gaussian Splatting (disabled when gs_save_dir is None)
+    cfg_gs     = cfg.get("gaussian_splat", {})
+    gs_module  = None
+    gs_seen_kfs = set()
+    if (cfg_gs.get("enabled") and cfg_gs.get("online") and gs_save_dir is not None):
+        from mast3r_slam.gaussian_splat import OnlineGaussianSplat
+        gs_module = OnlineGaussianSplat(cfg_gs, cfg.get("use_calib", False), K, device)
+        print("[GS Online] Incremental GS training enabled.")
 
     mode = states.get_mode()
     while mode is not Mode.TERMINATED:
@@ -137,9 +180,38 @@ def run_backend(cfg, model, states, keyframes, K):
         else:
             factor_graph.solve_GN_rays()
 
+        # ── Online GS: add KF then train with the freshly optimized poses
+        if gs_module is not None:
+            if idx not in gs_seen_kfs:
+                gs_module.add_keyframe(keyframes[idx])
+                gs_seen_kfs.add(idx)
+            gs_module.sync_poses(keyframes)
+            gs_module.train_gaussians(cfg_gs.get("online_iters_per_kf", 50))
+            if cfg_gs.get("pose_refine", False):
+                gs_module.refine_poses(cfg_gs.get("pose_refine_iters", 10))
+            # Drain non-KF aux frames queued by main thread since last solve
+            if nonkf_queue is not None:
+                aux_batch = []
+                while True:
+                    try:
+                        aux_batch.append(nonkf_queue.get_nowait())
+                    except Exception:
+                        break
+                if aux_batch:
+                    gs_module.add_aux_frames(aux_batch)
+
         with states.lock:
             if len(states.global_optimizer_tasks) > 0:
                 idx = states.global_optimizer_tasks.pop(0)
+
+    # ── Online GS finalization: optional extra steps + save
+    if gs_module is not None:
+        finalize_iters = cfg_gs.get("online_finalize_iters", 0)
+        if finalize_iters > 0:
+            print(f"[GS Online] Final polish: {finalize_iters} additional steps...")
+            gs_module.sync_poses(keyframes)
+            gs_module.train_gaussians(finalize_iters)
+        gs_module.save(gs_save_dir, gs_seq_name)
 
 
 if __name__ == "__main__":
@@ -222,7 +294,24 @@ if __name__ == "__main__":
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
 
-    backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
+    # Pass save paths to backend so it can write the online GS PLY at termination
+    gs_save_dir = gs_seq_name = None
+    cfg_gs_main = config.get("gaussian_splat", {})
+    gs_online = cfg_gs_main.get("enabled") and cfg_gs_main.get("online")
+    if dataset.save_results and gs_online:
+        gs_save_dir = save_dir
+        gs_seq_name = seq_name
+
+    # Queue for non-KF aux frames (main → backend); None when aux is disabled
+    nonkf_queue = None
+    if gs_online and cfg_gs_main.get("aux_ratio", 0.0) > 0.0:
+        nonkf_queue = mp.Queue(maxsize=150)
+
+    backend = mp.Process(
+        target=run_backend,
+        args=(config, model, states, keyframes, K,
+              gs_save_dir, gs_seq_name, nonkf_queue),
+    )
     backend.start()
 
     i = 0
@@ -230,6 +319,8 @@ if __name__ == "__main__":
 
     frames = []
     realtime_poses = []
+    frames_since_kf = 0   # frames elapsed since the most recent keyframe
+    last_kf_t = None      # (3,) CPU tensor — translation of last KF for novelty gate
 
     while True:
         mode = states.get_mode()
@@ -282,6 +373,13 @@ if __name__ == "__main__":
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
 
+            # Score and enqueue non-KF frames for aux GS supervision
+            if nonkf_queue is not None and not add_new_kf:
+                _try_enqueue_aux(
+                    frame, frames_since_kf, last_kf_t,
+                    nonkf_queue, cfg_gs_main,
+                )
+
         elif mode == Mode.RELOC:
             X, C = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
@@ -302,12 +400,17 @@ if __name__ == "__main__":
         if add_new_kf:
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
+            # Update novelty gate for next aux frame scoring
+            frames_since_kf = 0
+            last_kf_t = frame.T_WC.matrix()[0, :3, 3].detach().cpu()
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
                 with states.lock:
                     if len(states.global_optimizer_tasks) == 0:
                         break
                 time.sleep(0.01)
+        else:
+            frames_since_kf += 1
         # log time
         if i % 30 == 0:
             FPS = i / (time.time() - fps_timer)
@@ -328,10 +431,11 @@ if __name__ == "__main__":
         eval.save_keyframes(
             save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
         )
-        if config.get("gaussian_splat", {}).get("enabled", False):
+        cfg_gs = config.get("gaussian_splat", {})
+        if cfg_gs.get("enabled", False) and not cfg_gs.get("online", False):
             from mast3r_slam.gaussian_splat import train_gaussian_splat
             train_gaussian_splat(
-                keyframes, K, save_dir, seq_name, config["use_calib"], config["gaussian_splat"]
+                keyframes, K, save_dir, seq_name, config["use_calib"], cfg_gs
             )
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")

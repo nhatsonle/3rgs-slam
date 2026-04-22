@@ -523,6 +523,447 @@ def _quat_xyzw_to_matrix(q: torch.Tensor) -> torch.Tensor:
     ], dim=-1).reshape(3, 3)
 
 
+def _extract_single_keyframe(kf, use_calib: bool, threshold: float = 0.5):
+    """Extract Gaussian init data from one keyframe.
+
+    Returns a plain dict (no requires_grad) or None if no pixels pass threshold.
+    """
+    device = kf.X_canon.device
+    X = kf.X_canon
+    if use_calib and kf.K is not None:
+        X = constrain_points_to_ray(
+            kf.img_shape.flatten()[:2], X[None], kf.K
+        ).squeeze(0)
+    means_world = kf.T_WC.act(X)
+
+    conf = kf.get_average_conf().reshape(-1)
+    conf_max = conf.max().clamp(min=1e-6)
+    conf_norm = (conf / conf_max).clamp(1e-4, 1 - 1e-4)
+    valid = conf_norm > threshold
+    if not valid.any():
+        return None
+
+    opacity_logit = torch.log(conf_norm / (1.0 - conf_norm))
+    rgb = kf.uimg.reshape(-1, 3).to(device)
+    sh_dc = (rgb - 0.5) / SH_C0
+
+    H_img, W_img = kf.img_shape.flatten()[:2].tolist()
+    H_img, W_img = int(H_img), int(W_img)
+    X_grid = X.reshape(H_img, W_img, 3)
+    dx = F.pad(X_grid[:, 1:] - X_grid[:, :-1], (0, 0, 0, 1))
+    dy = F.pad(X_grid[1:] - X_grid[:-1], (0, 0, 0, 0, 0, 1))
+    sx = torch.linalg.norm(dx, dim=-1, keepdim=True).clamp(min=1e-6)
+    sy = torch.linalg.norm(dy, dim=-1, keepdim=True).clamp(min=1e-6)
+    sz = (sx + sy) / 2.0
+    log_scales = torch.log(torch.cat([sx, sy, sz], dim=-1)).reshape(-1, 3)
+    normal = F.normalize(
+        torch.cross(dx.reshape(-1, 3), dy.reshape(-1, 3), dim=-1), dim=-1
+    )
+    quats = _normal_to_quat_wxyz(normal)
+
+    depth_gt = X[:, 2].reshape(H_img, W_img).clamp(min=1e-3)
+    conf_map = conf_norm.reshape(H_img, W_img)
+    viewmat = _sim3_to_w2c(kf.T_WC).to(device)
+
+    return {
+        "means":      means_world[valid].detach(),
+        "sh_dc":      sh_dc[valid].detach(),
+        "log_scales": log_scales[valid].detach(),
+        "quats":      quats[valid].detach(),
+        "opacity":    opacity_logit[valid].detach(),
+        "viewmat":    viewmat,
+        "gt_image":   kf.uimg.to(device),
+        "depth_map":  depth_gt,
+        "conf_map":   conf_map,
+        "K":          kf.K if (use_calib and kf.K is not None) else None,
+        "H_img":      H_img,
+        "W_img":      W_img,
+    }
+
+
+def _append_keyframe_data(data: dict, optimizer, kf_data: dict) -> int:
+    """Append one keyframe's Gaussians into the live data dict and Adam state.
+
+    Returns the number of new Gaussians added.
+    """
+    param_keys = ["means", "sh_dc", "log_scales", "quats", "opacity"]
+    n_new = kf_data["means"].shape[0]
+
+    for key in param_keys:
+        old_p = data[key]
+        new_p = torch.cat(
+            [old_p.detach(), kf_data[key].to(old_p.device)], dim=0
+        ).requires_grad_(True)
+        state = optimizer.state.pop(old_p, {})
+        new_state = {}
+        if "exp_avg" in state:
+            pad = torch.zeros(n_new, *state["exp_avg"].shape[1:],
+                              device=state["exp_avg"].device)
+            new_state["exp_avg"]    = torch.cat([state["exp_avg"], pad])
+            new_state["exp_avg_sq"] = torch.cat([state["exp_avg_sq"], pad])
+            new_state["step"]       = state["step"]
+        optimizer.state[new_p] = new_state
+        for group in optimizer.param_groups:
+            if group["params"][0] is old_p:
+                group["params"][0] = new_p
+                break
+        data[key] = new_p
+
+    new_vm = kf_data["viewmat"].unsqueeze(0).to(data["viewmats"].device)
+    data["viewmats"] = torch.cat([data["viewmats"], new_vm], dim=0)
+    data["gt_images"].append(kf_data["gt_image"])
+    data["depth_maps"].append(kf_data["depth_map"])
+    data["conf_maps"].append(kf_data["conf_map"])
+    if data["Ks"] is not None and kf_data["K"] is not None:
+        data["Ks"] = torch.cat([data["Ks"], kf_data["K"].unsqueeze(0)], dim=0)
+
+    return n_new
+
+
+# ── 4. Online Gaussian Splatting ───────────────────────────────────────────────
+
+class OnlineGaussianSplat:
+    """Incrementally builds and trains a 3DGS scene alongside MASt3R-SLAM.
+
+    Called from the backend process after each GN optimization solve.
+    All training happens in the backend; results are saved to disk at termination.
+
+    All public methods accept a `threshold` guard (inherited from cfg) to prevent
+    Gaussians boom as new keyframes are added on long sequences.
+    """
+
+    def __init__(self, cfg: dict, use_calib: bool, K, device: str):
+        self.cfg          = cfg
+        self.use_calib    = use_calib
+        self.K_global     = K
+        self.device       = device
+
+        self.data         = None   # Gaussian parameters + per-KF rendering data
+        self.optimizer    = None
+        self.n_kf         = 0
+        self.train_step   = 0
+        self.absgrad_accum = None
+
+        self.H_img     = None
+        self.W_img     = None
+        self.Ks_render = None      # (K, 3, 3)
+
+        self.conf_thresh    = cfg.get("c_conf_threshold",    0.5)
+        self.max_gaussians  = cfg.get("max_gaussians",  2_000_000)
+        self.lambda_ssim    = cfg.get("lambda_ssim",         0.2)
+        self.lambda_depth   = cfg.get("lambda_depth",        0.1)
+        self.depth_min_conf = cfg.get("depth_min_conf",      0.3)
+        self.prune_thresh   = cfg.get("prune_opacity_thresh", 0.005)
+        self.grad_thresh    = cfg.get("grad_thresh",         2e-4)
+        self.densify_online = cfg.get("densify_online",      True)
+
+        # Aux (non-keyframe) photometric supervision
+        self.aux_frames     = []   # list of {gt_image, viewmat, weight}
+        self.aux_ratio      = cfg.get("aux_ratio",      0.3)
+        self.aux_max_frames = cfg.get("aux_max_frames", 200)
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def add_keyframe(self, kf, threshold: float = None) -> bool:
+        """Extract Gaussians from kf and append to the live scene.
+
+        Does NOT run training — call train_gaussians() after sync_poses().
+        threshold: override conf_thresh; prevents Gaussians boom on this KF.
+        """
+        thr = threshold if threshold is not None else self.conf_thresh
+        kf_data = _extract_single_keyframe(kf, self.use_calib, thr)
+        if kf_data is None:
+            print(f"[GS Online] KF {kf.frame_id}: no valid Gaussians above threshold.")
+            return False
+
+        if self.H_img is None:
+            self.H_img = kf_data["H_img"]
+            self.W_img = kf_data["W_img"]
+
+        n_new = kf_data["means"].shape[0]
+
+        if self.data is None:
+            self.data = {
+                "means":      kf_data["means"].requires_grad_(True),
+                "sh_dc":      kf_data["sh_dc"].requires_grad_(True),
+                "log_scales": kf_data["log_scales"].requires_grad_(True),
+                "quats":      kf_data["quats"].requires_grad_(True),
+                "opacity":    kf_data["opacity"].requires_grad_(True),
+                "viewmats":   kf_data["viewmat"].unsqueeze(0),
+                "gt_images":  [kf_data["gt_image"]],
+                "depth_maps": [kf_data["depth_map"]],
+                "conf_maps":  [kf_data["conf_map"]],
+                "Ks":         (kf_data["K"].unsqueeze(0)
+                               if kf_data["K"] is not None else None),
+            }
+            self._init_optimizer()
+            self.absgrad_accum = torch.zeros(n_new, device=self.device)
+        else:
+            n_before = self.data["means"].shape[0]
+            _append_keyframe_data(self.data, self.optimizer, kf_data)
+            n_after = self.data["means"].shape[0]
+            extra = n_after - n_before
+            self.absgrad_accum = torch.cat([
+                self.absgrad_accum,
+                torch.zeros(extra, device=self.device),
+            ])
+
+        self._append_k_render(kf_data["K"])
+        self.n_kf += 1
+        n_total = self.data["means"].shape[0]
+        print(
+            f"[GS Online] KF {self.n_kf} added | +{n_new:,} Gaussians "
+            f"| total {n_total:,}"
+        )
+        return True
+
+    def sync_poses(self, keyframes) -> None:
+        """Copy latest GN-optimized poses into viewmats (non-differentiable)."""
+        if self.data is None or self.n_kf == 0:
+            return
+        new_vms = []
+        for i in range(self.n_kf):
+            kf = keyframes[i]
+            new_vms.append(_sim3_to_w2c(kf.T_WC).to(self.device))
+        self.data["viewmats"] = torch.stack(new_vms)
+
+    def train_gaussians(self, n_steps: int, threshold: float = None) -> None:
+        """N Adam steps on Gaussian parameters with combined photometric loss.
+
+        Poses are fixed (use sync_poses before calling).
+        threshold: max-Gaussians guard; prevents density control from blooming.
+        """
+        if self.data is None or self.n_kf == 0 or n_steps == 0:
+            return
+        max_g = threshold if threshold is not None else self.max_gaussians
+
+        from gsplat import rasterization
+
+        for _ in range(n_steps):
+            # Sample either a KF (full loss) or an aux non-KF (L1 only)
+            use_aux = (
+                self.aux_ratio > 0.0
+                and len(self.aux_frames) > 0
+                and torch.rand(1).item() < self.aux_ratio
+            )
+            if use_aux:
+                aux_idx      = torch.randint(0, len(self.aux_frames), (1,)).item()
+                aux          = self.aux_frames[aux_idx]
+                viewmat      = aux["viewmat"].unsqueeze(0)
+                gt           = aux["gt_image"]
+                K_i          = self.Ks_render[0].unsqueeze(0)  # same camera
+                frame_weight = aux["weight"]
+                kf_idx       = None
+            else:
+                kf_idx       = torch.randint(0, self.n_kf, (1,)).item()
+                viewmat      = self.data["viewmats"][kf_idx].unsqueeze(0)
+                gt           = self.data["gt_images"][kf_idx]
+                K_i          = self.Ks_render[kf_idx].unsqueeze(0)
+                frame_weight = 1.0
+
+            render_colors, _, meta = rasterization(
+                means      = self.data["means"],
+                quats      = self.data["quats"],
+                scales     = torch.exp(self.data["log_scales"]),
+                opacities  = torch.sigmoid(self.data["opacity"]),
+                colors     = self.data["sh_dc"].unsqueeze(1),
+                viewmats   = viewmat,
+                Ks         = K_i,
+                width      = self.W_img,
+                height     = self.H_img,
+                sh_degree  = 0,
+                render_mode = "RGB+D",
+                absgrad    = True,
+                packed     = False,
+            )
+            render     = render_colors[0, :, :, :3].clamp(0.0, 1.0)
+            render_dep = render_colors[0, :, :, 3]
+
+            if render.grad_fn is None:
+                continue
+
+            l_l1 = (render - gt).abs().mean()
+            if use_aux:
+                # Aux frames: L1 only (locally-tracked pose — skip depth/SSIM)
+                loss = l_l1 * frame_weight
+            else:
+                l_d_ssim = (1.0 - _ssim(render, gt)) / 2.0
+                loss     = (1.0 - self.lambda_ssim) * l_l1 + self.lambda_ssim * l_d_ssim
+
+                if self.lambda_depth > 0.0:
+                    gt_dep = self.data["depth_maps"][kf_idx]
+                    conf_w = self.data["conf_maps"][kf_idx]
+                    valid  = (gt_dep > 1e-3) & (render_dep > 1e-3) & (conf_w > self.depth_min_conf)
+                    if valid.any():
+                        l_depth = (
+                            conf_w[valid]
+                            * (render_dep[valid].log() - gt_dep[valid].log()).abs()
+                        ).mean()
+                        loss = loss + self.lambda_depth * l_depth
+
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+
+            if "means2d" in meta and meta["means2d"].absgrad is not None:
+                g = meta["means2d"].absgrad.squeeze(0).norm(dim=-1).detach()
+                if g.shape[0] == self.absgrad_accum.shape[0]:
+                    self.absgrad_accum += g
+
+            torch.nn.utils.clip_grad_norm_(
+                [self.data["means"], self.data["log_scales"],
+                 self.data["quats"], self.data["opacity"]],
+                max_norm=1.0,
+            )
+            self.optimizer.step()
+
+            with torch.no_grad():
+                self.data["quats"].data = F.normalize(self.data["quats"].data, dim=-1)
+
+            self.train_step += 1
+
+            if self.densify_online and self.train_step % 100 == 0:
+                self._density_control(max_g)
+
+    def refine_poses(self, n_steps: int, threshold: float = None) -> None:
+        """N photometric gradient steps on per-KF viewmats (Gaussians frozen).
+
+        KF-0 is pinned as the global reference frame.
+        threshold: unused here (kept for API consistency).
+        """
+        if self.data is None or self.n_kf < 2 or n_steps == 0:
+            return
+
+        from gsplat import rasterization
+
+        # Differentiable free poses (all except the pinned first KF)
+        vm_fixed  = self.data["viewmats"][0].unsqueeze(0).detach()
+        vm_free   = self.data["viewmats"][1:].detach().clone().requires_grad_(True)
+        pose_opt  = torch.optim.Adam([vm_free], lr=self.cfg.get("lr_pose", 1e-4))
+
+        # Frozen Gaussian inputs
+        means_d     = self.data["means"].detach()
+        quats_d     = self.data["quats"].detach()
+        scales_d    = torch.exp(self.data["log_scales"].detach())
+        opacities_d = torch.sigmoid(self.data["opacity"].detach())
+        colors_d    = self.data["sh_dc"].detach().unsqueeze(1)
+
+        for _ in range(n_steps):
+            kf_idx = torch.randint(1, self.n_kf, (1,)).item()
+            vm     = vm_free[kf_idx - 1].unsqueeze(0)
+            gt     = self.data["gt_images"][kf_idx]
+            K_i    = self.Ks_render[kf_idx].unsqueeze(0)
+
+            render_colors, _, _ = rasterization(
+                means=means_d, quats=quats_d,
+                scales=scales_d, opacities=opacities_d, colors=colors_d,
+                viewmats=vm, Ks=K_i,
+                width=self.W_img, height=self.H_img,
+                sh_degree=0, packed=False,
+            )
+            render = render_colors[0, :, :, :3].clamp(0.0, 1.0)
+            if render.grad_fn is None:
+                continue
+            loss = (render - gt).abs().mean()
+            pose_opt.zero_grad()
+            loss.backward()
+            pose_opt.step()
+
+        with torch.no_grad():
+            self.data["viewmats"] = torch.cat(
+                [vm_fixed, vm_free.detach()], dim=0
+            )
+
+    def save(self, save_dir, seq_name: str) -> None:
+        """Save the incrementally trained Gaussians as a PLY file."""
+        if self.data is None:
+            print("[GS Online] Nothing to save.")
+            return
+        out_path = Path(save_dir) / f"{seq_name}_gs.ply"
+        _save_splat(out_path, self.data)
+        print(
+            f"[GS Online] Saved → {out_path}  "
+            f"({self.data['means'].shape[0]:,} Gaussians, "
+            f"{self.train_step} total steps across {self.n_kf} keyframes)"
+        )
+
+    def add_aux_frames(self, frames_data: list) -> None:
+        """Buffer non-KF frames for photometric-only supervision.
+
+        Called from backend after draining the nonkf_queue.  Frames are
+        rendered against existing Gaussians during train_gaussians() with
+        L1 loss only (no depth, no SSIM) and weighted by temporal decay.
+
+        frames_data: list of dicts with keys
+            'uimg'      – (H,W,3) float32 CPU tensor  [0,1]
+            'sim3_data' – raw lietorch.Sim3 data CPU tensor
+            'weight'    – float in (0, 1]
+        """
+        if self.data is None or self.H_img is None:
+            return
+        import lietorch as _lietorch
+        for fd in frames_data:
+            T_WC    = _lietorch.Sim3(fd["sim3_data"].to(self.device))
+            viewmat = _sim3_to_w2c(T_WC).to(self.device)
+            gt      = fd["uimg"].to(self.device)
+            self.aux_frames.append({
+                "gt_image": gt,
+                "viewmat":  viewmat,
+                "weight":   fd["weight"],
+            })
+        # Keep only the most recent frames to bound memory
+        if len(self.aux_frames) > self.aux_max_frames:
+            self.aux_frames = self.aux_frames[-self.aux_max_frames:]
+        if frames_data:
+            print(
+                f"[GS Online] +{len(frames_data)} aux frames | "
+                f"buffer {len(self.aux_frames)}/{self.aux_max_frames}"
+            )
+
+    # ── Private helpers ─────────────────────────────────────────────────────
+
+    def _init_optimizer(self):
+        params = [
+            {"params": [self.data["means"]],      "lr": self.cfg.get("lr_means",   1.6e-4)},
+            {"params": [self.data["sh_dc"]],      "lr": self.cfg.get("lr_sh",      2.5e-3)},
+            {"params": [self.data["log_scales"]], "lr": self.cfg.get("lr_scales",  5e-3)},
+            {"params": [self.data["quats"]],      "lr": self.cfg.get("lr_quats",   1e-3)},
+            {"params": [self.data["opacity"]],    "lr": self.cfg.get("lr_opacity", 5e-2)},
+        ]
+        self.optimizer = torch.optim.Adam(params, eps=1e-15)
+
+    def _append_k_render(self, K_kf):
+        if self.use_calib and K_kf is not None:
+            K = K_kf.to(self.device).unsqueeze(0)
+        else:
+            fx = fy = float(max(self.H_img, self.W_img))
+            cx, cy  = self.W_img / 2.0, self.H_img / 2.0
+            K = torch.tensor(
+                [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+                dtype=torch.float32, device=self.device,
+            ).unsqueeze(0)
+        self.Ks_render = (K if self.Ks_render is None
+                          else torch.cat([self.Ks_render, K], dim=0))
+
+    def _density_control(self, max_gaussians: int):
+        prune_mask = _prune_mask(self.data, threshold=self.prune_thresh)
+        if prune_mask.any():
+            _apply_mask(self.data, self.optimizer, ~prune_mask)
+            self.absgrad_accum = self.absgrad_accum[~prune_mask]
+
+        n = self.data["means"].shape[0]
+        if self.absgrad_accum.shape[0] == n and n < max_gaussians:
+            clone_mask = (self.absgrad_accum / max(self.train_step, 1)) > self.grad_thresh
+            if clone_mask.any():
+                _clone(self.data, self.optimizer, clone_mask,
+                       max_gaussians, max_gaussians)
+                allowed = min(clone_mask.sum().item(), max_gaussians - n)
+                self.absgrad_accum = torch.cat([
+                    self.absgrad_accum,
+                    torch.zeros(allowed, device=self.device),
+                ])
+        self.absgrad_accum.zero_()
+
+
 def _save_splat(path: Path, data: dict) -> None:
     """Save Gaussians as a standard 3DGS PLY (compatible with SuperSplat viewer).
 

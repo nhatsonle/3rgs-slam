@@ -22,3 +22,7 @@ gaussian_splat:
   lambda_ssim: 0.2
   lambda_depth: 0.1
   depth_min_conf: 0.3
+  # Set online: true to use incremental mode instead of offline training
+  online: true
+  online_iters_per_kf: 100
+  online_finalize_iters: 1000
