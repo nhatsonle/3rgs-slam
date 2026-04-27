@@ -104,3 +104,4 @@ Configs use YAML inheritance via `inherit:` key. `config/base.yaml` defines all 
 | Trajectory/PLY saving | `mast3r_slam/evaluate.py` |
 | CUDA backend source | `mast3r_slam/backend/src/` |
 
+All functions must have clear comments (usage, input, output)

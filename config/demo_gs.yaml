@@ -1,7 +1,7 @@
 inherit: "config/base.yaml"
 
 dataset:
-  subsample: 10   # ~120 frames from the 1207-frame video — fast PoC run
+  subsample: 1   
 
 gaussian_splat:
   enabled: true
@@ -24,5 +24,19 @@ gaussian_splat:
   depth_min_conf: 0.3
   # Set online: true to use incremental mode instead of offline training
   online: true
-  online_iters_per_kf: 100
-  online_finalize_iters: 1000
+  online_iters_per_kf: 200   # keep backend from falling behind during SLAM; bulk training in finalize
+  online_finalize_iters: 10000
+  # GlobalGaussianMap — multi-view fusion + association engine
+  use_global_map: true
+  map_baseline_thresh: 0.02
+  map_conf_thresh: 0.20
+  map_cooldown_frames: 3
+  map_window_size: 5
+  map_min_frames: 2
+  assoc_thresh: 0.05
+  assoc_voxel: 0.05
+  assoc_max_check: 3000
+  merge_ema: 0.30
+  lambda_reg: 0.01
+  reanchor_on_loop_closure: true
+  cleanup_interval_kf: 10

@@ -24,6 +24,9 @@ from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
 
+# GlobalGaussianMap import is deferred to run_backend to avoid
+# importing gsplat in the main process.
+
 
 def _blur_score(uimg: torch.Tensor) -> float:
     """Laplacian variance of image — lower = more blurry."""
@@ -104,22 +107,46 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         return successful_loop_closure
 
 
+def _drain_queue(q):
+    """Drain all currently available items from a multiprocessing queue."""
+    batch = []
+    while True:
+        try:
+            batch.append(q.get_nowait())
+        except Exception:
+            break
+    return batch
+
+
 def run_backend(cfg, model, states, keyframes, K,
-                gs_save_dir=None, gs_seq_name=None, nonkf_queue=None):
+                gs_save_dir=None, gs_seq_name=None,
+                nonkf_queue=None, mapping_queue=None):
     set_global_config(cfg)
 
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
     retrieval_database = load_retriever(model)
 
-    # Online Gaussian Splatting (disabled when gs_save_dir is None)
-    cfg_gs     = cfg.get("gaussian_splat", {})
-    gs_module  = None
+    # ── Select GS module ──────────────────────────────────────────────────────
+    cfg_gs      = cfg.get("gaussian_splat", {})
+    gs_module   = None
     gs_seen_kfs = set()
-    if (cfg_gs.get("enabled") and cfg_gs.get("online") and gs_save_dir is not None):
-        from mast3r_slam.gaussian_splat import OnlineGaussianSplat
-        gs_module = OnlineGaussianSplat(cfg_gs, cfg.get("use_calib", False), K, device)
-        print("[GS Online] Incremental GS training enabled.")
+    gs_enabled  = cfg_gs.get("enabled") and cfg_gs.get("online") and gs_save_dir is not None
+
+    if gs_enabled:
+        use_global_map = cfg_gs.get("use_global_map", False)
+        if use_global_map:
+            from mast3r_slam.gaussian_map import GlobalGaussianMap
+            gs_module = GlobalGaussianMap(
+                cfg_gs, cfg.get("use_calib", False), K, device
+            )
+            print("[GMap] GlobalGaussianMap online mode enabled.")
+        else:
+            from mast3r_slam.gaussian_splat import OnlineGaussianSplat
+            gs_module = OnlineGaussianSplat(
+                cfg_gs, cfg.get("use_calib", False), K, device
+            )
+            print("[GS Online] Incremental GS training enabled.")
 
     mode = states.get_mode()
     while mode is not Mode.TERMINATED:
@@ -127,13 +154,29 @@ def run_backend(cfg, model, states, keyframes, K,
         if mode == Mode.INIT or states.is_paused():
             time.sleep(0.01)
             continue
+
         if mode == Mode.RELOC:
             frame = states.get_frame()
+
+            # Step 11: capture poses before loop-closure solve
+            old_poses = None
+            if (gs_module is not None
+                    and cfg_gs.get("reanchor_on_loop_closure", True)
+                    and hasattr(gs_module, "capture_poses")):
+                old_poses = gs_module.capture_poses(keyframes)
+
             success = relocalization(frame, keyframes, factor_graph, retrieval_database)
             if success:
                 states.set_mode(Mode.TRACKING)
+
+                # Step 11: re-anchor Gaussians after loop-closure pose correction
+                if (old_poses is not None
+                        and hasattr(gs_module, "reanchor")):
+                    gs_module.reanchor(keyframes, old_poses)
+
             states.dequeue_reloc()
             continue
+
         idx = -1
         with states.lock:
             if len(states.global_optimizer_tasks) > 0:
@@ -142,9 +185,8 @@ def run_backend(cfg, model, states, keyframes, K,
             time.sleep(0.01)
             continue
 
-        # Graph Construction
+        # ── Graph Construction ────────────────────────────────────────────────
         kf_idx = []
-        # k to previous consecutive keyframes
         n_consec = 1
         for j in range(min(n_consec, idx)):
             kf_idx.append(idx - 1 - j)
@@ -162,9 +204,9 @@ def run_backend(cfg, model, states, keyframes, K,
         if len(lc_inds) > 0:
             print("Database retrieval", idx, ": ", lc_inds)
 
-        kf_idx = set(kf_idx)  # Remove duplicates by using set
-        kf_idx.discard(idx)  # Remove current kf idx if included
-        kf_idx = list(kf_idx)  # convert to list
+        kf_idx = set(kf_idx)
+        kf_idx.discard(idx)
+        kf_idx = list(kf_idx)
         frame_idx = [idx] * len(kf_idx)
         if kf_idx:
             factor_graph.add_factors(
@@ -180,23 +222,27 @@ def run_backend(cfg, model, states, keyframes, K,
         else:
             factor_graph.solve_GN_rays()
 
-        # ── Online GS: add KF then train with the freshly optimized poses
+        # ── Online GS ─────────────────────────────────────────────────────────
         if gs_module is not None:
             if idx not in gs_seen_kfs:
                 gs_module.add_keyframe(keyframes[idx])
                 gs_seen_kfs.add(idx)
+
+            # Step 3/6/7: drain mapping frames BEFORE sync so fusion uses fresh poses
+            if mapping_queue is not None and hasattr(gs_module, "add_mapping_frame"):
+                for mf in _drain_queue(mapping_queue):
+                    gs_module.add_mapping_frame(mf)
+
+            # Sync GN-optimised poses into viewmats after fusion
             gs_module.sync_poses(keyframes)
             gs_module.train_gaussians(cfg_gs.get("online_iters_per_kf", 50))
+
             if cfg_gs.get("pose_refine", False):
                 gs_module.refine_poses(cfg_gs.get("pose_refine_iters", 10))
-            # Drain non-KF aux frames queued by main thread since last solve
+
+            # Aux non-KF frames for photometric supervision
             if nonkf_queue is not None:
-                aux_batch = []
-                while True:
-                    try:
-                        aux_batch.append(nonkf_queue.get_nowait())
-                    except Exception:
-                        break
+                aux_batch = _drain_queue(nonkf_queue)
                 if aux_batch:
                     gs_module.add_aux_frames(aux_batch)
 
@@ -204,11 +250,42 @@ def run_backend(cfg, model, states, keyframes, K,
             if len(states.global_optimizer_tasks) > 0:
                 idx = states.global_optimizer_tasks.pop(0)
 
-    # ── Online GS finalization: optional extra steps + save
+    # ── Finalize ──────────────────────────────────────────────────────────────
     if gs_module is not None:
+        # Register any KF views the backend didn't reach before TERMINATED
+        with states.lock:
+            remaining_tasks = list(states.global_optimizer_tasks)
+        for kf_idx in remaining_tasks:
+            if kf_idx not in gs_seen_kfs:
+                try:
+                    gs_module.add_keyframe(keyframes[kf_idx])
+                    gs_seen_kfs.add(kf_idx)
+                except Exception:
+                    pass
+        # Also do a final GN solve pass so poses are up to date
+        if remaining_tasks:
+            print(f"[GMap] Finalize: registered {len(remaining_tasks)} missed KF views "
+                  f"(total {gs_module.n_kf} views).")
+            try:
+                if config["use_calib"]:
+                    factor_graph.solve_GN_calib()
+                else:
+                    factor_graph.solve_GN_rays()
+            except Exception:
+                pass
+
+        # Flush any mapping frames that arrived after the last GN solve
+        if mapping_queue is not None and hasattr(gs_module, "add_mapping_frame"):
+            remaining_mf = _drain_queue(mapping_queue)
+            for mf in remaining_mf:
+                gs_module.add_mapping_frame(mf)
+            if remaining_mf:
+                print(f"[GMap] Finalize: flushed {len(remaining_mf)} remaining mapping frames.")
+
         finalize_iters = cfg_gs.get("online_finalize_iters", 0)
         if finalize_iters > 0:
-            print(f"[GS Online] Final polish: {finalize_iters} additional steps...")
+            print(f"[GS/GMap] Final polish: {finalize_iters} additional steps "
+                  f"({gs_module.n_kf} views, {gs_module.data['means'].shape[0] if gs_module.data else 0:,} Gaussians)...")
             gs_module.sync_poses(keyframes)
             gs_module.train_gaussians(finalize_iters)
         gs_module.save(gs_save_dir, gs_seq_name)
@@ -307,10 +384,21 @@ if __name__ == "__main__":
     if gs_online and cfg_gs_main.get("aux_ratio", 0.0) > 0.0:
         nonkf_queue = mp.Queue(maxsize=150)
 
+    # Step 2: Mapping frame queue — non-KF frames selected by MappingFrameSelector
+    mapping_queue = None
+    use_global_map = gs_online and cfg_gs_main.get("use_global_map", False)
+    if use_global_map:
+        from mast3r_slam.gaussian_map import MappingFrameSelector
+        mapping_frame_selector = MappingFrameSelector(cfg_gs_main)
+        mapping_queue = mp.Queue(maxsize=300)
+        print("[GMap] MappingFrameSelector enabled.")
+    else:
+        mapping_frame_selector = None
+
     backend = mp.Process(
         target=run_backend,
         args=(config, model, states, keyframes, K,
-              gs_save_dir, gs_seq_name, nonkf_queue),
+              gs_save_dir, gs_seq_name, nonkf_queue, mapping_queue),
     )
     backend.start()
 
@@ -380,6 +468,29 @@ if __name__ == "__main__":
                     nonkf_queue, cfg_gs_main,
                 )
 
+            # Step 2: Enqueue mapping frames for GlobalGaussianMap
+            if (mapping_queue is not None
+                    and mapping_frame_selector is not None
+                    and not add_new_kf
+                    and frame.X_canon is not None):
+                if mapping_frame_selector.should_map(frame, last_kf_t):
+                    H_img = int(frame.img_shape.flatten()[0].item())
+                    W_img = int(frame.img_shape.flatten()[1].item())
+                    mf_data = {
+                        "uimg":      frame.uimg.cpu().float(),
+                        "sim3_data": frame.T_WC.data.detach().cpu(),
+                        "X_canon":   frame.X_canon.detach().cpu(),
+                        "C":         frame.C.detach().cpu(),
+                        "H_img":     H_img,
+                        "W_img":     W_img,
+                        "K": (frame.K.cpu() if frame.K is not None
+                              else (K.cpu() if K is not None else None)),
+                    }
+                    try:
+                        mapping_queue.put_nowait(mf_data)
+                    except Exception:
+                        pass  # queue full — drop silently, never block main
+
         elif mode == Mode.RELOC:
             X, C = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
@@ -403,6 +514,9 @@ if __name__ == "__main__":
             # Update novelty gate for next aux frame scoring
             frames_since_kf = 0
             last_kf_t = frame.T_WC.matrix()[0, :3, 3].detach().cpu()
+            # Reset mapping frame selector cooldown on new KF
+            if mapping_frame_selector is not None:
+                mapping_frame_selector.reset()
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
                 with states.lock:
@@ -445,7 +559,10 @@ if __name__ == "__main__":
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             cv2.imwrite(f"{savedir}/{i}.png", frame)
 
-    print("done")
+    print("done — waiting for backend GS finalize...")
     backend.join()
+    if dataset.save_results and gs_online:
+        gs_flag = "use_global_map" if cfg_gs_main.get("use_global_map") else "online"
+        print(f"[GS] Backend finished. GS output → {gs_save_dir}/{gs_seq_name}_gs.ply  (mode: {gs_flag})")
     if not args.no_viz:
         viz.join()

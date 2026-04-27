@@ -1,8 +1,9 @@
 # MASt3R-SLAM Codebase Changes — Overview
 
 This document summarises every modification made to the original MASt3R-SLAM codebase.
-For a deep-dive on the Gaussian Splatting integration specifically, see
-[gaussian_splatting_integration.md](gaussian_splatting_integration.md).
+For details on the Gaussian Splatting integration see the sibling docs:
+- [gaussian_splatting_integration.md](gaussian_splatting_integration.md) — offline batch mode
+- [online_gs_integration.md](online_gs_integration.md) — online/incremental mode + GlobalGaussianMap
 
 ---
 
@@ -10,26 +11,33 @@ For a deep-dive on the Gaussian Splatting integration specifically, see
 
 | File | Type | Purpose |
 |---|---|---|
-| `mast3r_slam/gaussian_splat.py` | **New** | Entire offline 3DGS pipeline |
-| `config/demo_gs.yaml` | **New** | Demo config for quick PoC run |
-| `config/base.yaml` | Modified | Added `gaussian_splat` config block |
-| `main.py` | Modified | Calls GS training after SLAM finishes |
+| `mast3r_slam/gaussian_splat.py` | New | Offline 3DGS pipeline + `OnlineGaussianSplat` class |
+| `mast3r_slam/gaussian_map.py` | **New** | `GlobalGaussianMap` — 12-step multi-view incremental map |
+| `config/demo_gs.yaml` | New/Modified | Demo config; now enables `GlobalGaussianMap` by default |
+| `config/base.yaml` | Modified | Extended `gaussian_splat` block (online + GlobalGaussianMap params) |
+| `main.py` | Modified | Backend selection, `MappingFrameSelector`, `mapping_queue`, finalize drain |
 | `mast3r_slam/backend/src/gn_kernels.cu` | Modified | Build fix for `torch::linalg_norm` API change |
 | `CLAUDE.md` | New | Developer guide / AI coding instructions |
 
 ---
 
-## 1. `mast3r_slam/gaussian_splat.py` (new, ~530 lines)
+## 1. `mast3r_slam/gaussian_splat.py` (new, ~970 lines)
 
-The entire offline 3DGS module. Three public functions:
+The offline 3DGS module and the original online incremental class.
 
-### `extract_gaussians(keyframes, use_calib, threshold=0.5)`
-Converts the final SLAM state into Gaussian parameters (see
-[gaussian_splatting_integration.md](gaussian_splatting_integration.md) for details).
+### Public functions
 
-### `train_gaussian_splat(keyframes, K, save_dir, seq_name, use_calib, cfg, threshold=None)`
-Full Adam-based 3DGS training loop with adaptive density control and a combined
-photometric + structural + geometric loss (L1 + D-SSIM + depth).
+#### `extract_gaussians(keyframes, use_calib, threshold=0.5)`
+Converts the final SLAM state into Gaussian parameters.
+
+#### `train_gaussian_splat(keyframes, K, save_dir, seq_name, use_calib, cfg, threshold=None)`
+Full offline Adam training loop with adaptive density control and a combined
+photometric + structural + geometric loss (L1 + D-SSIM + depth). Used when
+`online: false`.
+
+#### `class OnlineGaussianSplat`
+Incremental per-keyframe Gaussian extraction and training. Superseded by
+`GlobalGaussianMap` for better quality but preserved for backward compatibility.
 
 ### Private helpers
 `_psnr`, `_ssim`, `_prune_mask`, `_clone`, `_apply_mask`, `_index_data`,
@@ -37,66 +45,106 @@ photometric + structural + geometric loss (L1 + D-SSIM + depth).
 
 ---
 
-## 2. `config/base.yaml` — added `gaussian_splat` block
+## 2. `mast3r_slam/gaussian_map.py` (new, ~1050 lines)
+
+Implements the 12-step GlobalGaussianMap integration plan. See
+[online_gs_integration.md](online_gs_integration.md) for the full design.
+
+### Classes
+
+#### `MappingFrameSelector`
+Decides which non-keyframe frames enter the mapping pipeline based on baseline,
+confidence, and cooldown. Runs in the **main process**.
+
+#### `LocalFusionBuffer`
+Sliding-window buffer (default 7 frames) that fuses geometry from multiple
+viewpoints before Gaussian candidate generation.
+
+#### `VoxelAssociation`
+Python-dict spatial hash (5 cm voxels) that checks 27-cell neighbourhoods to
+prevent object duplication when spawning new Gaussians.
+
+#### `GlobalGaussianMap`
+Drop-in replacement for `OnlineGaussianSplat`. Activates when
+`gaussian_splat.use_global_map: true`. Implements Steps 2–12:
+- Step 2 — mapping frame selection (non-KF frames only)
+- Step 3 — local sliding-window fusion
+- Step 4 — Gaussian candidate generation (confidence-weighted, isotropic init)
+- Steps 6–7 — association engine: merge close Gaussians, spawn new ones
+- Step 8 — density control (prune + clone from abs-2D-gradient)
+- Step 9 — hybrid loss (L1 + D-SSIM + log-depth + regulariser)
+- Step 11 — loop-closure re-anchor (propagates per-KF pose corrections)
+- Step 12 — periodic cleanup (prune dead + single-observation Gaussians)
+
+---
+
+## 3. `config/base.yaml` — extended `gaussian_splat` block
+
+The block now has three sections: base training, online incremental, and
+GlobalGaussianMap parameters.
 
 ```yaml
 gaussian_splat:
-  enabled: false           # off by default; enable in child configs
-  c_conf_threshold: 0.5    # MASt3R confidence gate for Gaussian creation
-  max_gaussians: 2000000   # hard memory cap
-  n_iters: 10000
-  lr_means: 1.6e-4
-  lr_opacity: 5.0e-2
-  lr_scales: 5.0e-3
-  lr_quats: 1.0e-3
-  lr_sh: 2.5e-3
-  densify_from_iter: 500
-  densify_until_iter: 5000
-  densify_interval: 100
-  opacity_reset_interval: 3000
-  prune_opacity_thresh: 0.005
-  grad_thresh: 2.0e-4
-  # Loss weights
-  lambda_ssim: 0.2       # weight of D-SSIM term; 0 = pure L1
-  lambda_depth: 0.1      # weight of log-depth loss; 0 = disabled
-  depth_min_conf: 0.3    # ignore depth loss where MASt3R confidence is below this
+  enabled: false
+  # ... base training params unchanged ...
+  online: false
+  online_iters_per_kf: 50
+  online_finalize_iters: 0
+  aux_ratio: 0.3
+  aux_max_frames: 200
+  # ── GlobalGaussianMap (use_global_map: true) ──
+  use_global_map: false
+  map_baseline_thresh: 0.02
+  map_conf_thresh: 0.20
+  map_cooldown_frames: 3
+  map_window_size: 7
+  map_min_frames: 2
+  assoc_thresh: 0.05
+  assoc_voxel: 0.05
+  assoc_max_check: 5000
+  merge_ema: 0.30
+  lambda_reg: 0.01
+  reanchor_on_loop_closure: true
+  cleanup_interval_kf: 10
 ```
 
-All existing configs are unaffected because `enabled: false` by default.
+All existing configs are unaffected (`enabled: false`, `use_global_map: false` by default).
 
 ---
 
-## 3. `config/demo_gs.yaml` (new)
+## 4. `config/demo_gs.yaml` (updated)
 
-Inherits `base.yaml`; enables GS with a fast demo profile:
-- `subsample: 10` → ~15 keyframes from a 1200-frame video
-- `max_gaussians: 500000`, `n_iters: 3000`
+Now enables `GlobalGaussianMap` with a fast demo profile:
+- `subsample: 10` → ~120 frames from the 1207-frame video
+- `online_iters_per_kf: 20` — keeps the backend from falling behind during SLAM
+- `online_finalize_iters: 2000` — bulk training after all KFs are registered
+- `use_global_map: true` — activates the 12-step pipeline
 
-Run:
 ```bash
-python main.py --dataset IMG_2520.mp4 --config config/demo_gs.yaml --no-viz --save-as gs_poc
+python main.py --dataset IMG_2520.mp4 --config config/demo_gs.yaml \
+  --no-viz --save-as results
+# Output: logs/results/IMG_2520_gs.ply  (separate from SLAM trajectory PLY)
 ```
 
 ---
 
-## 4. `main.py` — 5-line addition
+## 5. `main.py` — major updates
 
-After `eval.save_keyframes(...)` at line 324:
-
-```python
-if config.get("gaussian_splat", {}).get("enabled", False):
-    from mast3r_slam.gaussian_splat import train_gaussian_splat
-    train_gaussian_splat(
-        keyframes, K, save_dir, seq_name, config["use_calib"], config["gaussian_splat"]
-    )
-```
-
-Triggers only when `save_results=True` (i.e. `--save-as` is passed) and
-`gaussian_splat.enabled: true`. No impact on normal SLAM runs.
+| Change | Purpose |
+|---|---|
+| `_drain_queue(q)` helper | Atomically drains a `mp.Queue` into a list |
+| `run_backend` adds `mapping_queue=None` parameter | Receives mapping frames from main |
+| Backend selects `GlobalGaussianMap` vs `OnlineGaussianSplat` via `use_global_map` | Config-driven module switch |
+| Drain `mapping_queue` inside GN-solve loop (before `sync_poses`) | Multi-view fusion runs at correct time |
+| RELOC mode: `capture_poses` before GN, `reanchor` after success | Loop-closure pose corrections propagate to Gaussians |
+| Finalize: drain remaining KF tasks + `mapping_queue` before save | Prevents data loss when backend lags behind main |
+| Print save path after `backend.join()` | User knows which file to open |
+| Main creates `MappingFrameSelector` + `mapping_queue` when `use_global_map=True` | Sends non-KF frames to backend |
+| Main enqueues qualifying non-KF frames via `mapping_queue.put_nowait()` | Never blocks tracking thread |
 
 ---
 
-## 5. `mast3r_slam/backend/src/gn_kernels.cu` — build fix
+## 6. `mast3r_slam/backend/src/gn_kernels.cu` — build fix
 
 PyTorch's C++ API changed the signature of `torch::linalg::linalg_norm` between
 releases, breaking compilation. Replaced with a numerically equivalent manual
@@ -113,7 +161,7 @@ delta_norm = at::sqrt((dx * dx).sum());
 
 ---
 
-## Extra dependency
+## Extra dependencies
 
 ```bash
 pip install gsplat        # 3DGS rasterizer (gsplat 1.5.3 used during development)
