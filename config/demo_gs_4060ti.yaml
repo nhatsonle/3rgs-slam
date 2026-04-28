@@ -1,0 +1,62 @@
+inherit: "config/base.yaml"
+
+dataset:
+  # 4060 Ti balance: reduce frame load but keep temporal coverage.
+  subsample: 2
+
+gaussian_splat:
+  enabled: true
+
+  # Core quality/safety controls
+  c_conf_threshold: 0.50
+  max_gaussians: 350000
+
+  # Use improved online global mapper
+  online: true
+  use_global_map: true
+
+  # Online training budget (balanced for 16GB VRAM)
+  online_iters_per_kf: 70
+  online_finalize_iters: 3000
+  heartbeat_sec: 30
+
+  # Optimizer/loss (keep stable defaults)
+  lr_means: 1.6e-4
+  lr_opacity: 5.0e-2
+  lr_scales: 5.0e-3
+  lr_quats: 1.0e-3
+  lr_sh: 2.5e-3
+  lambda_ssim: 0.2
+  lambda_depth: 0.1
+  lambda_reg: 0.01
+  depth_min_conf: 0.3
+
+  # Densification (slightly conservative for VRAM/runtime)
+  densify_online: true
+  densify_from_iter: 300
+  densify_until_iter: 2500
+  densify_interval: 100
+  opacity_reset_interval: 1500
+  prune_opacity_thresh: 0.005
+  grad_thresh: 2.0e-4
+
+  # Aux non-KF supervision
+  aux_ratio: 0.25
+  aux_max_frames: 120
+  aux_blur_thresh: 50.0
+  aux_novelty_min: 0.05
+  aux_max_age: 8
+  aux_decay: 0.95
+
+  # GlobalGaussianMap controls
+  map_baseline_thresh: 0.02
+  map_conf_thresh: 0.20
+  map_cooldown_frames: 3
+  map_window_size: 5
+  map_min_frames: 2
+  assoc_thresh: 0.05
+  assoc_voxel: 0.05
+  assoc_max_check: 3000
+  merge_ema: 0.30
+  reanchor_on_loop_closure: true
+  cleanup_interval_kf: 10

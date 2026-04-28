@@ -243,7 +243,13 @@ def run_backend(cfg, model, states, keyframes, K,
             # Scale training steps by number of new KFs in batch
             n_new_kfs = len(pending_tasks)
             iters_per_kf = cfg_gs.get("online_iters_per_kf", 50)
-            gs_module.train_gaussians(iters_per_kf * n_new_kfs)
+            req_steps = iters_per_kf * n_new_kfs
+            print(
+                f"[GS Backend] dispatch train | req_steps={req_steps} | "
+                f"batch_kf={n_new_kfs}",
+                flush=True,
+            )
+            gs_module.train_gaussians(req_steps)
 
             if cfg_gs.get("pose_refine", False):
                 gs_module.refine_poses(cfg_gs.get("pose_refine_iters", 10))

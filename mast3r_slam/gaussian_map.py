@@ -18,6 +18,7 @@ Implements the 12-step integration plan:
 from __future__ import annotations
 
 import math
+import time
 from collections import deque
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -501,6 +502,8 @@ class GlobalGaussianMap:
 
         # Running global confidence max for cross-KF consistent normalization
         self._global_conf_max: float = 0.0
+        self.heartbeat_sec = cfg.get("heartbeat_sec", 30)
+        self._last_heartbeat_ts = time.time()
 
         print("[GMap] GlobalGaussianMap initialized.")
 
@@ -798,12 +801,30 @@ class GlobalGaussianMap:
         if self.optimizer is None:
             self._init_optimizer()
 
+        start_step = self.train_step
+        start_ts = time.time()
+        print(
+            f"[GMap] train start | req_steps={n_steps} | step={start_step} | "
+            f"N={self.data['means'].shape[0]:,} | KFs={self.n_kf}",
+            flush=True,
+        )
+
         torch.set_grad_enabled(True)
         from gsplat import rasterization
 
         max_g = threshold if threshold is not None else self.max_gaussians
 
         for _ in range(n_steps):
+            now = time.time()
+            if now - self._last_heartbeat_ts >= self.heartbeat_sec:
+                n_gs = self.data["means"].shape[0]
+                print(
+                    f"[GMap] heartbeat | train_step={self.train_step} | "
+                    f"n_steps_req={n_steps} | N={n_gs:,} | KFs={self.n_kf} | "
+                    f"aux={len(self.aux_frames)}"
+                )
+                self._last_heartbeat_ts = now
+
             use_aux = (
                 self.aux_ratio > 0.0
                 and len(self.aux_frames) > 0
@@ -919,6 +940,15 @@ class GlobalGaussianMap:
                     f"[GMap] step {self.train_step:5d} | loss {float(loss):.4f} | "
                     f"PSNR {psnr:.2f} dB | N={n_gs:,} | KFs={self.n_kf}"
                 )
+
+        end_ts = time.time()
+        done_steps = self.train_step - start_step
+        print(
+            f"[GMap] train done  | req_steps={n_steps} | done_steps={done_steps} | "
+            f"step={self.train_step} | elapsed={end_ts - start_ts:.1f}s | "
+            f"N={self.data['means'].shape[0]:,}",
+            flush=True,
+        )
 
     # ── Aux frames ────────────────────────────────────────────────────────────
 

@@ -9,6 +9,7 @@ number of Gaussians created/kept, preventing memory blowups on long sequences.
 """
 
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -667,6 +668,8 @@ class OnlineGaussianSplat:
         self.aux_frames     = []   # list of {gt_image, viewmat, weight}
         self.aux_ratio      = cfg.get("aux_ratio",      0.3)
         self.aux_max_frames = cfg.get("aux_max_frames", 200)
+        self.heartbeat_sec  = cfg.get("heartbeat_sec", 30)
+        self._last_heartbeat_ts = time.time()
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -743,9 +746,27 @@ class OnlineGaussianSplat:
             return
         max_g = threshold if threshold is not None else self.max_gaussians
 
+        start_step = self.train_step
+        start_ts = time.time()
+        print(
+            f"[GS Online] train start | req_steps={n_steps} | step={start_step} | "
+            f"N={self.data['means'].shape[0]:,} | KFs={self.n_kf}",
+            flush=True,
+        )
+
         from gsplat import rasterization
 
         for _ in range(n_steps):
+            now = time.time()
+            if now - self._last_heartbeat_ts >= self.heartbeat_sec:
+                n_gs = self.data["means"].shape[0]
+                print(
+                    f"[GS Online] heartbeat | train_step={self.train_step} | "
+                    f"n_steps_req={n_steps} | N={n_gs:,} | KFs={self.n_kf} | "
+                    f"aux={len(self.aux_frames)}"
+                )
+                self._last_heartbeat_ts = now
+
             # Sample either a KF (full loss) or an aux non-KF (L1 only)
             use_aux = (
                 self.aux_ratio > 0.0
@@ -829,6 +850,15 @@ class OnlineGaussianSplat:
 
             if self.densify_online and self.train_step % 100 == 0:
                 self._density_control(max_g)
+
+        end_ts = time.time()
+        done_steps = self.train_step - start_step
+        print(
+            f"[GS Online] train done  | req_steps={n_steps} | done_steps={done_steps} | "
+            f"step={self.train_step} | elapsed={end_ts - start_ts:.1f}s | "
+            f"N={self.data['means'].shape[0]:,}",
+            flush=True,
+        )
 
     def refine_poses(self, n_steps: int, threshold: float = None) -> None:
         """N photometric gradient steps on per-KF viewmats (Gaussians frozen).

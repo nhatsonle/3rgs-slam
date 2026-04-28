@@ -1,7 +1,7 @@
 inherit: "config/base.yaml"
 
 dataset:
-  subsample: 1   
+  subsample: 2  
 
 gaussian_splat:
   enabled: true
@@ -25,7 +25,8 @@ gaussian_splat:
   # Set online: true to use incremental mode instead of offline training
   online: true
   online_iters_per_kf: 100   # per-KF steps; with batch processing, total = iters * n_new_kfs
-  online_finalize_iters: 5000
+  heartbeat_sec: 30          # online GS heartbeat log interval (seconds)
+  online_finalize_iters: 3000
   # GlobalGaussianMap — multi-view fusion + association engine
   use_global_map: true
   map_baseline_thresh: 0.02
