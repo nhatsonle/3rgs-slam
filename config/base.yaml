@@ -85,12 +85,12 @@ gaussian_splat:
   depth_min_conf: 0.3    # ignore depth loss where MASt3R confidence is below this
   # Online (incremental) mode — trains GS alongside SLAM in the backend process
   online: true
-  online_iters_per_kf: 50      # Adam steps per new keyframe
+  online_iters_per_kf: 100     # Adam steps per new keyframe (total = iters * batch_size)
   densify_online: true          # density control during online training
   pose_refine: false            # photometric pose refinement after each KF (experimental)
   pose_refine_iters: 10         # steps of pose refinement per KF
   lr_pose: 1.0e-4               # Adam LR for pose refinement (4×4 viewmat)
-  online_finalize_iters: 0      # extra steps after SLAM ends; 0 = save immediately
+  online_finalize_iters: 3000   # extra steps after SLAM ends for quality polish
   # Non-keyframe auxiliary supervision (photometric L1 only, no Gaussian init)
   aux_ratio: 0.3          # fraction of training steps sampling an aux non-KF frame
   aux_max_frames: 200     # max aux frames held in buffer (oldest discarded)

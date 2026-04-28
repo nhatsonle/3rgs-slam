@@ -107,8 +107,12 @@ def extract_gaussians(
         # ── Camera pose for renderer (world→cam 4×4)
         viewmat = _sim3_to_w2c(kf.T_WC)                        # (4, 4)
 
-        # ── Per-pixel GT depth (camera z) and confidence — used for depth loss
-        depth_gt = X[:, 2].reshape(H_img, W_img).clamp(min=1e-3)   # (H, W)
+        # ── Per-pixel GT depth — must match rendered depth frame.
+        # Rendered depth = s*z_cam (Sim3 scale baked into world points,
+        # stripped from viewmat).  Multiply camera z by scale to match.
+        sim3_data = kf.T_WC.data.reshape(-1)
+        sim3_scale = float(sim3_data[-1].exp())   # lietorch Sim3 stores log(s)
+        depth_gt = (X[:, 2] * sim3_scale).reshape(H_img, W_img).clamp(min=1e-3)
         conf_map = conf_norm.reshape(H_img, W_img)                  # (H, W) in (0,1)
 
         all_means.append(means_world[valid])
@@ -561,7 +565,9 @@ def _extract_single_keyframe(kf, use_calib: bool, threshold: float = 0.5):
     )
     quats = _normal_to_quat_wxyz(normal)
 
-    depth_gt = X[:, 2].reshape(H_img, W_img).clamp(min=1e-3)
+    sim3_data = kf.T_WC.data.reshape(-1)
+    sim3_scale = float(sim3_data[-1].exp())
+    depth_gt = (X[:, 2] * sim3_scale).reshape(H_img, W_img).clamp(min=1e-3)
     conf_map = conf_norm.reshape(H_img, W_img)
     viewmat = _sim3_to_w2c(kf.T_WC).to(device)
 

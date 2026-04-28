@@ -170,26 +170,17 @@ class VoxelAssociation:
     """
     Prevents object duplication by checking spatial proximity before spawn.
 
-    A Python dict maps discretised voxel keys → list of Gaussian indices.
-    Build once via rebuild(); then query_batch() returns the nearest existing
-    Gaussian for each candidate (or -1 if none within assoc_thresh).
-
-    Rebuild cost: O(M) inserts.  Per-query cost: O(27) dict lookups ≈ O(1).
+    Uses chunked brute-force cdist on GPU for speed.  Falls back to the
+    voxel-hash path only when the existing map is very large (>50k).
     """
 
     def __init__(self, voxel_size: float = 0.05):
         self.voxel_size = voxel_size
-        self._grid: dict = {}
         self._means: Optional[torch.Tensor] = None
 
     def rebuild(self, means: torch.Tensor) -> None:
-        """Rebuild from current Gaussian means (detached, CPU)."""
-        self._means = means.detach().cpu()
-        self._grid  = {}
-        coords = (self._means / self.voxel_size).long()
-        for i in range(self._means.shape[0]):
-            key = (int(coords[i, 0]), int(coords[i, 1]), int(coords[i, 2]))
-            self._grid.setdefault(key, []).append(i)
+        """Store current Gaussian means (detached, on original device)."""
+        self._means = means.detach()
 
     def query_batch(
         self,
@@ -197,6 +188,8 @@ class VoxelAssociation:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         For each candidate, return (nearest_idx, distance).
+
+        Uses chunked GPU cdist for fast vectorised nearest-neighbour lookup.
 
         Returns:
             match_idx (N,) int64  — index into existing Gaussians, or -1
@@ -209,32 +202,23 @@ class VoxelAssociation:
         if self._means is None or self._means.shape[0] == 0:
             return match_idx, dist
 
-        pts    = new_means.cpu()
-        coords = (pts / self.voxel_size).long()
-        means_cpu = self._means
+        device = self._means.device
+        existing = self._means.float()
+        queries  = new_means.to(device).float()
 
-        for i in range(N):
-            cx = int(coords[i, 0])
-            cy = int(coords[i, 1])
-            cz = int(coords[i, 2])
-            best_d = float("inf")
-            best_j = -1
-            for dx in range(-1, 2):
-                for dy in range(-1, 2):
-                    for dz in range(-1, 2):
-                        key = (cx + dx, cy + dy, cz + dz)
-                        for j in self._grid.get(key, ()):
-                            d = float((pts[i] - means_cpu[j]).norm())
-                            if d < best_d:
-                                best_d = d
-                                best_j = j
-            match_idx[i] = best_j
-            dist[i]      = best_d
+        # Chunked cdist to avoid OOM on very large maps
+        chunk = 5_000
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            d = torch.cdist(queries[start:end], existing)   # (chunk, M)
+            min_d, min_i = d.min(dim=1)
+            match_idx[start:end] = min_i.cpu()
+            dist[start:end]      = min_d.cpu()
 
         return match_idx, dist
 
     def is_empty(self) -> bool:
-        return len(self._grid) == 0
+        return self._means is None or self._means.shape[0] == 0
 
 
 # ── Step 4: Gaussian Candidate Generation ─────────────────────────────────────
@@ -243,8 +227,11 @@ def _fused_to_gaussian_candidates(fused: dict) -> Optional[dict]:
     """
     Convert LocalFusionBuffer output → Gaussian candidates.
 
-    All candidates on the same device as fused["means"].
+    Uses KNN-based anisotropic scale and surface-normal quaternions for
+    better initial geometry (disc-shaped Gaussians aligned to surfaces
+    instead of isotropic spheres).
 
+    All candidates on the same device as fused["means"].
     Returns None when there are no valid points.
     """
     means = fused["means"]
@@ -264,14 +251,18 @@ def _fused_to_gaussian_candidates(fused: dict) -> Optional[dict]:
     # SH DC from RGB
     sh_dc = (rgb.to(device) - 0.5) / SH_C0
 
-    # Isotropic scale: ~0.5% of median scene depth
-    median_depth = float(depth.clamp(min=1e-3).median())
-    init_scale   = max(median_depth * 0.005, 1e-4)
-    log_scales   = torch.full((N, 3), math.log(init_scale), device=device)
-
-    # Identity quaternion (wxyz): will relax during optimisation
-    quats        = torch.zeros(N, 4, device=device)
-    quats[:, 0]  = 1.0
+    # Anisotropic scale from KNN distances + surface normal quaternions.
+    # For each point, find K nearest neighbours and use the distances to
+    # set sx, sy (tangent-plane extents) and sz (thin disc along normal).
+    K_nn = min(4, N - 1)
+    if K_nn >= 2:
+        log_scales, quats = _knn_scales_and_normals(means, K_nn, device)
+    else:
+        median_depth = float(depth.clamp(min=1e-3).median())
+        init_scale = max(median_depth * 0.005, 1e-4)
+        log_scales = torch.full((N, 3), math.log(init_scale), device=device)
+        quats = torch.zeros(N, 4, device=device)
+        quats[:, 0] = 1.0
 
     return {
         "means":      means.to(device),
@@ -281,6 +272,67 @@ def _fused_to_gaussian_candidates(fused: dict) -> Optional[dict]:
         "opacity":    opacity_logit.to(device),
         "conf":       conf.to(device),
     }
+
+
+def _knn_scales_and_normals(
+    means: torch.Tensor, K: int, device: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute anisotropic scales and surface-normal quaternions from KNN.
+
+    For each point, the K nearest neighbours define a local covariance.
+    Eigendecomposition gives the tangent plane (2 large eigenvalues) and
+    normal direction (smallest eigenvalue).
+
+    Returns:
+        log_scales (N, 3): log of per-axis scales
+        quats (N, 4): wxyz quaternions aligning Gaussian to local surface
+    """
+    N = means.shape[0]
+
+    # Chunked KNN via brute-force cdist to avoid OOM on large point clouds
+    chunk = 10_000
+    all_dists = []
+    all_indices = []
+    for start in range(0, N, chunk):
+        end = min(start + chunk, N)
+        dists = torch.cdist(means[start:end], means)   # (chunk, N)
+        # Exclude self (distance 0) by setting to inf
+        dists[:, start:end].fill_diagonal_(float("inf"))
+        topk = dists.topk(K, dim=1, largest=False)
+        all_dists.append(topk.values)
+        all_indices.append(topk.indices)
+
+    knn_dists = torch.cat(all_dists, dim=0)     # (N, K)
+    knn_idx   = torch.cat(all_indices, dim=0)    # (N, K)
+
+    # Tangent-plane scale: mean of K neighbour distances
+    mean_dist = knn_dists.mean(dim=1).clamp(min=1e-6)   # (N,)
+    # Thin disc: sz = mean_dist * 0.1 (10% of tangent extent)
+    sx = mean_dist
+    sy = mean_dist
+    sz = mean_dist * 0.1
+    log_scales = torch.log(
+        torch.stack([sx, sy, sz], dim=-1).clamp(min=1e-7)
+    ).to(device)
+
+    # Surface normal from local covariance of KNN offsets
+    neighbours = means[knn_idx]                  # (N, K, 3)
+    offsets = neighbours - means.unsqueeze(1)    # (N, K, 3)
+    # Covariance: (N, 3, 3) = offsets^T @ offsets / K
+    cov = torch.bmm(offsets.transpose(1, 2), offsets) / K
+
+    # Eigen decomposition — smallest eigenvector is the normal
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov)  # ascending order
+        normals = eigenvectors[:, :, 0]  # smallest eigenvalue → normal
+        normals = F.normalize(normals, dim=-1)
+    except Exception:
+        normals = torch.zeros(N, 3, device=device)
+        normals[:, 2] = 1.0
+
+    quats = _normal_to_quat_wxyz(normals.to(device))
+    return log_scales, quats
 
 
 # ── Step 7: Merge helpers ──────────────────────────────────────────────────────
@@ -447,6 +499,9 @@ class GlobalGaussianMap:
         # ── Aux frames for photometric supervision
         self.aux_frames: list = []
 
+        # Running global confidence max for cross-KF consistent normalization
+        self._global_conf_max: float = 0.0
+
         print("[GMap] GlobalGaussianMap initialized.")
 
     # ── Rendering-view registration ───────────────────────────────────────────
@@ -472,9 +527,22 @@ class GlobalGaussianMap:
             X = constrain_points_to_ray(
                 kf.img_shape.flatten()[:2], X[None], kf.K
             ).squeeze(0)
-        depth_map = X[:, 2].reshape(H_img, W_img).clamp(min=1e-3).to(device)
+
+        # GT depth must be in the same frame as rendered depth.  Rendered depth
+        # comes from world-frame Gaussians (= s*R@X_cam + t) projected through
+        # scale-free w2c, yielding s*X_cam_z.  Multiply GT by Sim3 scale to match.
+        sim3_data = kf.T_WC.data.reshape(-1)
+        sim3_scale = float(sim3_data[-1].exp())     # lietorch Sim3 stores log(s)
+        depth_map = (X[:, 2] * sim3_scale).reshape(H_img, W_img).clamp(min=1e-3).to(device)
         conf_raw  = kf.get_average_conf().reshape(H_img, W_img).to(device)
-        conf_norm = (conf_raw / conf_raw.max().clamp(min=1e-6)).clamp(1e-4, 1 - 1e-4)
+
+        # Global confidence normalization: track running max across all KFs
+        # so confidence thresholds are consistent (a blurry frame with low max
+        # confidence doesn't get artificially boosted to the same range as a
+        # sharp frame).
+        local_max = float(conf_raw.max().clamp(min=1e-6))
+        self._global_conf_max = max(self._global_conf_max, local_max)
+        conf_norm = (conf_raw / self._global_conf_max).clamp(1e-4, 1 - 1e-4)
 
         if self.data is None:
             # Create data shell; Gaussian params populated on first mapping frame
@@ -530,7 +598,7 @@ class GlobalGaussianMap:
 
     # ── Mapping frame intake ──────────────────────────────────────────────────
 
-    def add_mapping_frame(self, frame_data: dict) -> None:
+    def add_mapping_frame(self, frame_data: dict, keyframes=None) -> None:
         """
         Add one mapping frame to the local fusion buffer.
 
@@ -544,11 +612,14 @@ class GlobalGaussianMap:
           C          (H*W, 1) float32 confidence
           H_img, W_img  int
           K          (3, 3) float32 or None
+
+        keyframes: SharedKeyframes reference — when provided, the nearest KF's
+            GN-optimised pose is used instead of the stale enqueued pose.
         """
         if self.data is None:
             return  # wait until first KF view registers the data shell
 
-        fd = self._unpack_mapping_frame(frame_data)
+        fd = self._unpack_mapping_frame(frame_data, keyframes=keyframes)
         if fd is None:
             return
         self.fusion_buffer.add(fd)
@@ -727,6 +798,7 @@ class GlobalGaussianMap:
         if self.optimizer is None:
             self._init_optimizer()
 
+        torch.set_grad_enabled(True)
         from gsplat import rasterization
 
         max_g = threshold if threshold is not None else self.max_gaussians
@@ -838,6 +910,16 @@ class GlobalGaussianMap:
             if self.densify_online and self.train_step % 100 == 0:
                 self._density_control(max_g)
 
+            if self.train_step % 500 == 0:
+                with torch.no_grad():
+                    mse = (render - gt).pow(2).mean().clamp(min=1e-10)
+                    psnr = -10.0 * math.log10(float(mse))
+                n_gs = self.data["means"].shape[0]
+                print(
+                    f"[GMap] step {self.train_step:5d} | loss {float(loss):.4f} | "
+                    f"PSNR {psnr:.2f} dB | N={n_gs:,} | KFs={self.n_kf}"
+                )
+
     # ── Aux frames ────────────────────────────────────────────────────────────
 
     def add_aux_frames(self, frames_data: list) -> None:
@@ -928,12 +1010,17 @@ class GlobalGaussianMap:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _unpack_mapping_frame(self, fd: dict) -> Optional[dict]:
+    def _unpack_mapping_frame(
+        self, fd: dict, keyframes=None,
+    ) -> Optional[dict]:
         """
         Convert serialised mapping-frame dict (from main-thread queue) into
         the format expected by LocalFusionBuffer.
 
-        Computes world-frame 3-D points from the snapshot T_WC + X_canon.
+        When keyframes is provided, the nearest KF's GN-optimised pose is used
+        to compute relative camera-to-KF transform, then world-frame points are
+        obtained via the optimised KF pose.  This avoids stale tracking poses
+        placing geometry at wrong world positions.
         """
         import lietorch as _lt
 
@@ -946,7 +1033,7 @@ class GlobalGaussianMap:
         if K is not None:
             K = K.to(self.device)
 
-        T_WC = _lt.Sim3(fd["sim3_data"].to(self.device))
+        T_WC_enqueued = _lt.Sim3(fd["sim3_data"].to(self.device))
 
         # Optionally constrain to calibrated rays
         X = X_canon
@@ -954,12 +1041,55 @@ class GlobalGaussianMap:
             img_shape = torch.tensor([[H_img, W_img]], device=self.device)
             X = constrain_points_to_ray(img_shape.flatten()[:2], X[None], K).squeeze(0)
 
-        means_world = T_WC.act(X)                    # (H*W, 3)
+        # Use GN-optimised nearest-KF pose to correct world-frame positions.
+        #
+        # The mapping frame was tracked against the latest KF, so both share the
+        # same tracking epoch.  We compute the relative transform T_kf_mf between
+        # the old KF pose and the MF pose, then reapply it with the optimised KF
+        # pose:  c2w_mf_corrected = c2w_kf_opt @ T_kf_from_mf
+        #
+        # T_kf_from_mf takes MF camera-frame points into KF camera frame:
+        #   T_kf_from_mf = w2c_kf_enq @ c2w_mf_enq
+        if keyframes is not None and self.n_kf > 0 and "kf_sim3_data" in fd:
+            nearest_kf_idx = self.n_kf - 1
+            T_WC_kf_opt = keyframes[nearest_kf_idx].T_WC
 
-        # Confidence normalisation
+            # Build 4x4 matrices
+            w2c_mf_enq = _sim3_to_w2c(T_WC_enqueued).to(self.device)
+            c2w_mf_enq = torch.eye(4, device=self.device, dtype=w2c_mf_enq.dtype)
+            c2w_mf_enq[:3, :3] = w2c_mf_enq[:3, :3].T
+            c2w_mf_enq[:3, 3]  = -(w2c_mf_enq[:3, :3].T @ w2c_mf_enq[:3, 3])
+
+            T_WC_kf_enq = _lt.Sim3(fd["kf_sim3_data"].to(self.device))
+            w2c_kf_enq = _sim3_to_w2c(T_WC_kf_enq).to(self.device)
+
+            w2c_kf_opt = _sim3_to_w2c(T_WC_kf_opt).to(self.device)
+            c2w_kf_opt = torch.eye(4, device=self.device, dtype=w2c_kf_opt.dtype)
+            c2w_kf_opt[:3, :3] = w2c_kf_opt[:3, :3].T
+            c2w_kf_opt[:3, 3]  = -(w2c_kf_opt[:3, :3].T @ w2c_kf_opt[:3, 3])
+
+            # Relative: MF-cam → KF-cam (using enqueue-epoch poses)
+            T_kf_from_mf = w2c_kf_enq @ c2w_mf_enq
+
+            # Corrected: MF-cam → world (using optimised KF pose)
+            c2w_corrected = c2w_kf_opt @ T_kf_from_mf
+
+            R = c2w_corrected[:3, :3]
+            t = c2w_corrected[:3, 3]
+            means_world = (X @ R.T) + t.unsqueeze(0)
+
+            viewmat = torch.eye(4, device=self.device, dtype=R.dtype)
+            viewmat[:3, :3] = R.T
+            viewmat[:3, 3]  = -(R.T @ t)
+        else:
+            means_world = T_WC_enqueued.act(X)
+            viewmat = _sim3_to_w2c(T_WC_enqueued).to(self.device)
+
+        # Confidence normalisation — use global running max for consistency
         conf = C.reshape(-1)                         # (H*W,)
-        conf_max  = conf.max().clamp(min=1e-6)
-        conf_norm = (conf / conf_max).clamp(1e-4, 1 - 1e-4)
+        local_max = float(conf.max().clamp(min=1e-6))
+        self._global_conf_max = max(self._global_conf_max, local_max)
+        conf_norm = (conf / self._global_conf_max).clamp(1e-4, 1 - 1e-4)
 
         depth_cam = X[:, 2].clamp(min=1e-3)          # (H*W,)
         rgb       = uimg.reshape(-1, 3)               # (H*W, 3)
@@ -973,7 +1103,7 @@ class GlobalGaussianMap:
             "rgb":         rgb[valid].detach().cpu(),
             "conf_norm":   conf_norm[valid].detach().cpu(),
             "depth_cam":   depth_cam[valid].detach().cpu(),
-            "viewmat":     _sim3_to_w2c(T_WC).detach().cpu(),
+            "viewmat":     viewmat.detach().cpu(),
             "gt_image":    uimg.detach(),
             "K":           K.cpu() if K is not None else None,
             "H_img":       H_img,

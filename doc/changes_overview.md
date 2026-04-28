@@ -161,6 +161,27 @@ delta_norm = at::sqrt((dx * dx).sum());
 
 ---
 
+## 7. Tracking ↔ Mapping synchronization fixes
+
+Eight issues were identified and fixed to improve 3DGS map quality:
+
+| # | Issue | Fix | Files |
+|---|---|---|---|
+| 1 | `GlobalGaussianMap.train_gaussians` lacked explicit `grad_enabled(True)` guard | Added `torch.set_grad_enabled(True)` at start of training | `gaussian_map.py` |
+| 2 | Mapping frame poses were stale tracking snapshots | Re-compute world-frame points using GN-optimised nearest-KF pose via relative transform | `gaussian_map.py`, `main.py` |
+| 3 | Backend processed one KF task per loop; fell behind main thread | Batch-drain all pending tasks, one GN solve per batch, register all KF views | `main.py` |
+| 4 | Isotropic Gaussian init (spheres) in GlobalGaussianMap | KNN-based anisotropic scales + surface-normal quaternions from local covariance | `gaussian_map.py` |
+| 5 | Per-KF confidence normalization made thresholds inconsistent | Running global confidence max across all KFs/mapping frames | `gaussian_map.py` |
+| 6 | Depth GT (camera z) vs rendered depth (scaled by Sim3 s) mismatch | Multiply `depth_gt` by Sim3 scale to match rendered depth frame | `gaussian_map.py`, `gaussian_splat.py` |
+| 7 | Insufficient online training budget | Increased defaults; training steps scale with batch size | `base.yaml`, `demo_gs.yaml`, `main.py` |
+| 8 | VoxelAssociation was pure-Python O(N×27×M) loop | Replaced with chunked GPU `cdist` nearest-neighbour | `gaussian_map.py` |
+
+Main thread now enqueues `kf_sim3_data` (the nearest KF's Sim3 pose at enqueue time)
+alongside each mapping frame, enabling the backend to compute the correct relative
+transform and apply it with the GN-optimised KF pose.
+
+---
+
 ## Extra dependencies
 
 ```bash

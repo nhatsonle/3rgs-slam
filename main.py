@@ -177,46 +177,47 @@ def run_backend(cfg, model, states, keyframes, K,
             states.dequeue_reloc()
             continue
 
-        idx = -1
+        # ── Drain ALL pending tasks in one batch to prevent backend lag ─────
         with states.lock:
-            if len(states.global_optimizer_tasks) > 0:
-                idx = states.global_optimizer_tasks[0]
-        if idx == -1:
+            pending_tasks = list(states.global_optimizer_tasks)
+        if not pending_tasks:
             time.sleep(0.01)
             continue
 
-        # ── Graph Construction ────────────────────────────────────────────────
-        kf_idx = []
-        n_consec = 1
-        for j in range(min(n_consec, idx)):
-            kf_idx.append(idx - 1 - j)
-        frame = keyframes[idx]
-        retrieval_inds = retrieval_database.update(
-            frame,
-            add_after_query=True,
-            k=config["retrieval"]["k"],
-            min_thresh=config["retrieval"]["min_thresh"],
-        )
-        kf_idx += retrieval_inds
-
-        lc_inds = set(retrieval_inds)
-        lc_inds.discard(idx - 1)
-        if len(lc_inds) > 0:
-            print("Database retrieval", idx, ": ", lc_inds)
-
-        kf_idx = set(kf_idx)
-        kf_idx.discard(idx)
-        kf_idx = list(kf_idx)
-        frame_idx = [idx] * len(kf_idx)
-        if kf_idx:
-            factor_graph.add_factors(
-                kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
+        # Build factor graph for every pending KF
+        for idx in pending_tasks:
+            kf_idx = []
+            n_consec = 1
+            for j in range(min(n_consec, idx)):
+                kf_idx.append(idx - 1 - j)
+            frame = keyframes[idx]
+            retrieval_inds = retrieval_database.update(
+                frame,
+                add_after_query=True,
+                k=config["retrieval"]["k"],
+                min_thresh=config["retrieval"]["min_thresh"],
             )
+            kf_idx += retrieval_inds
+
+            lc_inds = set(retrieval_inds)
+            lc_inds.discard(idx - 1)
+            if len(lc_inds) > 0:
+                print("Database retrieval", idx, ": ", lc_inds)
+
+            kf_idx = set(kf_idx)
+            kf_idx.discard(idx)
+            kf_idx = list(kf_idx)
+            frame_idx = [idx] * len(kf_idx)
+            if kf_idx:
+                factor_graph.add_factors(
+                    kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
+                )
 
         with states.lock:
             states.edges_ii[:] = factor_graph.ii.cpu().tolist()
             states.edges_jj[:] = factor_graph.jj.cpu().tolist()
 
+        # One GN solve over the full accumulated graph
         if config["use_calib"]:
             factor_graph.solve_GN_calib()
         else:
@@ -224,18 +225,25 @@ def run_backend(cfg, model, states, keyframes, K,
 
         # ── Online GS ─────────────────────────────────────────────────────────
         if gs_module is not None:
-            if idx not in gs_seen_kfs:
-                gs_module.add_keyframe(keyframes[idx])
-                gs_seen_kfs.add(idx)
+            # Register ALL KF views from this batch
+            for idx in pending_tasks:
+                if idx not in gs_seen_kfs:
+                    gs_module.add_keyframe(keyframes[idx])
+                    gs_seen_kfs.add(idx)
 
-            # Step 3/6/7: drain mapping frames BEFORE sync so fusion uses fresh poses
+            # Sync GN-optimised poses FIRST so mapping frame unpacking uses
+            # corrected KF poses as anchors instead of stale tracking poses
+            gs_module.sync_poses(keyframes)
+
+            # Steps 3/6/7: drain mapping frames with access to optimised keyframes
             if mapping_queue is not None and hasattr(gs_module, "add_mapping_frame"):
                 for mf in _drain_queue(mapping_queue):
-                    gs_module.add_mapping_frame(mf)
+                    gs_module.add_mapping_frame(mf, keyframes=keyframes)
 
-            # Sync GN-optimised poses into viewmats after fusion
-            gs_module.sync_poses(keyframes)
-            gs_module.train_gaussians(cfg_gs.get("online_iters_per_kf", 50))
+            # Scale training steps by number of new KFs in batch
+            n_new_kfs = len(pending_tasks)
+            iters_per_kf = cfg_gs.get("online_iters_per_kf", 50)
+            gs_module.train_gaussians(iters_per_kf * n_new_kfs)
 
             if cfg_gs.get("pose_refine", False):
                 gs_module.refine_poses(cfg_gs.get("pose_refine_iters", 10))
@@ -246,9 +254,11 @@ def run_backend(cfg, model, states, keyframes, K,
                 if aux_batch:
                     gs_module.add_aux_frames(aux_batch)
 
+        # Pop all processed tasks
         with states.lock:
-            if len(states.global_optimizer_tasks) > 0:
-                idx = states.global_optimizer_tasks.pop(0)
+            for _ in range(len(pending_tasks)):
+                if states.global_optimizer_tasks:
+                    states.global_optimizer_tasks.pop(0)
 
     # ── Finalize ──────────────────────────────────────────────────────────────
     if gs_module is not None:
@@ -278,7 +288,7 @@ def run_backend(cfg, model, states, keyframes, K,
         if mapping_queue is not None and hasattr(gs_module, "add_mapping_frame"):
             remaining_mf = _drain_queue(mapping_queue)
             for mf in remaining_mf:
-                gs_module.add_mapping_frame(mf)
+                gs_module.add_mapping_frame(mf, keyframes=keyframes)
             if remaining_mf:
                 print(f"[GMap] Finalize: flushed {len(remaining_mf)} remaining mapping frames.")
 
@@ -476,6 +486,7 @@ if __name__ == "__main__":
                 if mapping_frame_selector.should_map(frame, last_kf_t):
                     H_img = int(frame.img_shape.flatten()[0].item())
                     W_img = int(frame.img_shape.flatten()[1].item())
+                    last_kf = keyframes.last_keyframe()
                     mf_data = {
                         "uimg":      frame.uimg.cpu().float(),
                         "sim3_data": frame.T_WC.data.detach().cpu(),
@@ -485,6 +496,7 @@ if __name__ == "__main__":
                         "W_img":     W_img,
                         "K": (frame.K.cpu() if frame.K is not None
                               else (K.cpu() if K is not None else None)),
+                        "kf_sim3_data": last_kf.T_WC.data.detach().cpu(),
                     }
                     try:
                         mapping_queue.put_nowait(mf_data)
