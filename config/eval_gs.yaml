@@ -1,0 +1,56 @@
+inherit: "config/eval_calib.yaml"
+
+# ── SLAM settings (inherited from eval_calib.yaml) ────────────────────────────
+# use_calib: True   (from eval_calib)
+# single_thread: True (deterministic, required for reproducible benchmark)
+# subsample: 2      (TUM is 30 fps → subsample 2 = 15 fps input, matches paper)
+# dataset.subsample: 1 ← uncomment for maximum keyframe density (slower)
+
+gaussian_splat:
+  # ── Online GS (MASt3R-GS paper, benchmark quality) ───────────────────────
+  online_enabled: true
+  enabled: false  # disable offline batch GS
+
+  # ── Gaussian budget ───────────────────────────────────────────────────────
+  max_gaussians: 1000000        # 1M cap for full sequences (500k too tight)
+  max_gaussians_per_kf: 30000   # per-keyframe insertion cap
+
+  # ── Initialization ────────────────────────────────────────────────────────
+  c_conf_threshold: 0.4         # confidence gate for X_canon → lower = denser
+  disc_z_factor: 0.1            # z-axis = in-plane * 0.1 → proper disc init
+  max_log_scale: -2.5           # cap on largest axis (preserves disc shape via shift-down)
+  min_log_scale: -7.0
+  max_scale_ratio: 8.0          # needle: s1/s2 > 8 → remove (discs s1/s2≈1 are safe)
+
+  # ── Coarse mapping (Stage 1) ──────────────────────────────────────────────
+  window_size: 5                # W most-recent cameras per step
+  random_history: 2             # R random historical cameras per step
+  steps_per_keyframe: 200       # more steps → better-initialized Gaussians
+  idle_train_steps: 20          # train while waiting for next keyframe
+
+  # ── Fine refinement (Stage 2) ────────────────────────────────────────────
+  n_iters_fine: 5000            # high-quality final refinement
+  fine_log_interval: 500
+  fine_prune_thresh: 0.01       # initial floater prune before fine stage
+
+  # ── Loss weights (paper Eq.13) ────────────────────────────────────────────
+  alpha_rgb: 0.8
+  lambda_iso: 0.1
+  lambda_depth: 0.1
+  depth_min_conf: 0.3
+  lambda_ssim: 0.2              # D-SSIM complement improves perceptual quality
+
+  # ── Density control ───────────────────────────────────────────────────────
+  densify_from_iter: 100
+  densify_until_iter: 4000      # must be > n_iters_fine when step counter resets
+  densify_interval: 100
+  opacity_reset_interval: 999999  # disabled (fine stage also disables)
+  prune_opacity_thresh: 0.005
+  grad_thresh: 2.0e-4
+
+  # ── Learning rates ────────────────────────────────────────────────────────
+  lr_means: 1.6e-4
+  lr_opacity: 5.0e-2
+  lr_scales: 5.0e-3
+  lr_quats: 1.0e-3
+  lr_sh: 2.5e-3

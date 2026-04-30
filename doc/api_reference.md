@@ -1,135 +1,171 @@
-# API Reference — `mast3r_slam/gaussian_splat.py`
+# API Reference — Online + Offline 3DGS
+
+Primary online module: `mast3r_slam/online_gaussian_splat.py`  
+Legacy offline module: `mast3r_slam/gaussian_splat.py`
 
 ---
 
-## Public functions
+## Online public API (`online_gaussian_splat.py`)
 
-### `extract_gaussians(keyframes, use_calib, threshold=0.5) → dict`
+### `make_keyframe_snapshot(kf_idx: int, frame, use_calib: bool) -> dict`
 
-Converts a fully-populated `SharedKeyframes` buffer into a flat dict of
-Gaussian parameters ready for training.
+Builds a picklable keyframe payload for the online GS queue.
 
-**Parameters**
+Returned keys:
+- `type`: `"new_kf"`
+- `kf_idx`, `frame_id`
+- `uimg`, `X_canon`, `C`, `N`
+- `T_WC_data`
+- `K` (or `None`)
+- `img_shape`
 
-| Name | Type | Description |
-|---|---|---|
-| `keyframes` | `SharedKeyframes` | Final SLAM keyframe buffer (post-optimisation) |
-| `use_calib` | `bool` | If `True`, applies `constrain_points_to_ray` before transforming to world frame |
-| `threshold` | `float` | Normalised-confidence cutoff in `(0, 1)`. Higher = fewer Gaussians. Prevents memory blowup. |
-
-**Returns** — dict with keys:
-
-| Key | Shape | Description |
-|---|---|---|
-| `means` | `(N, 3)` | World-frame Gaussian centres, `requires_grad=True` |
-| `sh_dc` | `(N, 3)` | DC spherical harmonic colour coefficients |
-| `log_scales` | `(N, 3)` | Log-space anisotropic scales |
-| `quats` | `(N, 4)` | Unit quaternions **wxyz** convention |
-| `opacity` | `(N,)` | Logit-space opacity |
-| `viewmats` | `(K, 4, 4)` | World→cam matrices for each keyframe (CUDA) |
-| `gt_images` | `list[(H,W,3)]` | Reference RGB images in `[0,1]` (CUDA) |
-| `depth_maps` | `list[(H,W)]` | GT camera-z depth per keyframe from `X_canon[:, 2]` (CUDA) |
-| `conf_maps` | `list[(H,W)]` | Normalised confidence per keyframe, used to weight depth loss (CUDA) |
-| `Ks` | `(K,3,3)` or `None` | Intrinsics per keyframe; `None` when uncalibrated |
+Notes:
+- Tensors are cloned to CPU to safely cross process boundaries.
+- `C` and `N` are used to recover average confidence per pixel in the GS worker.
 
 ---
 
-### `train_gaussian_splat(keyframes, K, save_dir, seq_name, use_calib, cfg, threshold=None) → None`
+### `run_online_gs(cfg, states, keyframes, save_dir, seq_name, gs_queue) -> None`
 
-Full offline training loop. Calls `extract_gaussians`, runs Adam optimisation
-with adaptive density control, logs PSNR/SSIM, and saves the result as a PLY.
+Entry point for online mapping worker process.
 
-**Parameters**
+Event protocol on `gs_queue`:
+- `{"type": "new_kf", ...}`: insert and optimize with fresh keyframe
+- `{"type": "terminate"}`: sync final poses, run fine refinement, save map
 
-| Name | Type | Description |
-|---|---|---|
-| `keyframes` | `SharedKeyframes` | Final SLAM keyframe buffer |
-| `K` | `Tensor(3,3)` or `None` | Global camera intrinsics (uncalibrated: `None`) |
-| `save_dir` | `Path` | Output directory |
-| `seq_name` | `str` | Filename stem; output is `<save_dir>/<seq_name>_gs.ply` |
-| `use_calib` | `bool` | Passed through to `extract_gaussians` |
-| `cfg` | `dict` | `gaussian_splat` config block from YAML |
-| `threshold` | `int` or `None` | Hard cap on Gaussian count; overrides `cfg["max_gaussians"]` when set |
+Outputs:
+- `<save_dir>/<seq_name>_online_gs.ply`
+
+Behavior:
+- Stage 1 (coarse online): incremental insertion + sliding-window optimization.
+- Stage 2 (fine): post-SLAM refinement using final optimized poses.
 
 ---
 
-## Private helpers
+## Online core class (`GaussianMapper`)
 
-### Metric helpers
+### `insert_keyframe(snapshot: dict, threshold: Optional[int] = None) -> None`
 
-#### `_psnr(render, gt) → float`
-Peak Signal-to-Noise Ratio in dB. Both inputs `(H, W, 3)` float in `[0, 1]`.
+Initializes and appends Gaussian primitives from one keyframe snapshot.
 
-#### `_ssim(render, gt, window_size=11) → Tensor (scalar)`
-Structural Similarity Index using an 11×11 Gaussian window (σ=1.5).
-Returns a **differentiable tensor** so it can be used directly in the loss
-(`L_D-SSIM = (1 − _ssim(...)) / 2`). Call `.item()` when logging.
-Implemented with `F.conv2d` — no external metric library needed.
+Key controls:
+- confidence gate: `c_conf_threshold`
+- per-kf cap: `max_gaussians_per_kf` (or `threshold` override)
+- global cap: `max_gaussians`
 
 ---
 
-### Density control
+### `train_step(n_steps, window_size, random_history) -> dict`
 
-#### `_prune_mask(data, threshold=0.005) → BoolTensor(N,)`
-Returns `True` for Gaussians whose sigmoid opacity is below `threshold`.
+Runs sliding-window optimization for coarse stage and returns accumulated loss
+stats (`loss`, `l_rgb`, `l_depth`, `l_iso`, `n_steps`).
 
-#### `_clone(data, optimizer, mask, current_max, threshold) → None`
-Clones Gaussians selected by `mask` and appends them to `data` and the
-Adam state. Respects the hard cap `threshold`. Adds small position jitter so
-clones don't overlap originals.
-
-#### `_apply_mask(data, optimizer, keep) → None`
-Compacts all per-Gaussian tensors and Adam state to the indices in `keep`.
-Used for pruning.
-
-#### `_index_data(data, idx) → dict`
-Returns a copy of `data` with only the Gaussians at `idx`. Detaches and
-re-sets `requires_grad=True` so Adam starts fresh on the subset.
+Loss form:
+- `L = alpha_rgb * L_rgb + (1 - alpha_rgb) * L_depth + lambda_iso * L_iso`
+- Optional D-SSIM blend controlled by `lambda_ssim`.
 
 ---
 
-### Geometry helpers
+### `sync_poses_from_shared(keyframes) -> None`
 
-#### `_normal_to_quat_wxyz(normals) → Tensor(N, 4)`
-Converts `(N, 3)` unit normals to wxyz quaternions that align the canonical
-z-axis with the normal direction. Handles degenerate ±z cases.
-
-#### `_sim3_to_w2c(T_WC) → Tensor(4, 4)`
-Converts a `lietorch.Sim3` camera-to-world pose to a 4×4 world-to-cam matrix.
-Uses `as_SE3` to strip scale (safe because world-frame points already carry scale).
-
-#### `_quat_xyzw_to_matrix(q) → Tensor(3, 3)`
-Converts an xyzw quaternion (lietorch convention) to a 3×3 rotation matrix.
+Refreshes renderer camera matrices from latest SLAM poses in shared memory.
+Used periodically during coarse stage and before fine stage.
 
 ---
 
-### Output
+### `fine_refine(n_iters: int, log_interval: int) -> None`
 
-#### `_save_splat(path, data) → None`
-Writes a standard 3DGS PLY file compatible with SuperSplat and other viewers.
-Field layout: `x y z f_dc_0 f_dc_1 f_dc_2 opacity scale_0 scale_1 scale_2 rot_0 rot_1 rot_2 rot_3`.
+Runs final high-iteration refinement after SLAM completion.
+Commonly uses `fine_lambda_depth = 0.0` to avoid cross-camera Sim3 depth-scale
+inconsistency effects.
 
 ---
 
-## Config reference (`gaussian_splat` block in YAML)
+### `save(save_dir: Path, seq_name: str) -> None`
+
+Saves current online Gaussian state as standard 3DGS PLY:
+- `<save_dir>/<seq_name>_online_gs.ply`
+
+---
+
+## Offline API (still available)
+
+### `extract_gaussians(keyframes, use_calib, threshold=0.5) -> dict`
+
+Batch extraction from final keyframes.
+
+### `train_gaussian_splat(keyframes, K, save_dir, seq_name, use_calib, cfg, threshold=None) -> None`
+
+Legacy offline batch optimization.
+Output file:
+- `<save_dir>/<seq_name>_gs.ply`
+
+---
+
+## Shared helper functions (offline module, reused by online)
+
+- `_psnr`, `_ssim`
+- `_prune_mask`, `_clone`, `_apply_mask`
+- `_normal_to_quat_wxyz`
+- `_sim3_to_w2c`
+- `_save_splat`
+
+These helpers are imported by the online mapper to avoid duplicated
+implementations.
+
+---
+
+## Config reference (`gaussian_splat`)
+
+### Mode switches
 
 | Key | Default | Description |
 |---|---|---|
-| `enabled` | `false` | Enable GS reconstruction (requires `--save-as`) |
-| `c_conf_threshold` | `0.5` | Confidence gate for Gaussian creation |
-| `max_gaussians` | `2000000` | Hard cap — primary OOM guard |
-| `n_iters` | `10000` | Training iterations |
-| `lr_means` | `1.6e-4` | Adam LR for Gaussian centres |
-| `lr_opacity` | `5.0e-2` | Adam LR for opacity |
-| `lr_scales` | `5.0e-3` | Adam LR for scales |
-| `lr_quats` | `1.0e-3` | Adam LR for rotations |
-| `lr_sh` | `2.5e-3` | Adam LR for DC colour |
-| `densify_from_iter` | `500` | Start adaptive density control after this iter |
-| `densify_until_iter` | `5000` | Stop adaptive density control after this iter |
-| `densify_interval` | `100` | Run density control every N iters |
-| `opacity_reset_interval` | `3000` | Reset all opacities to ~0.12 every N iters |
-| `prune_opacity_thresh` | `0.005` | Prune Gaussians below this opacity |
-| `grad_thresh` | `2.0e-4` | Clone Gaussians above this abs-2D-gradient |
-| `lambda_ssim` | `0.2` | D-SSIM loss weight; `0` = pure L1 |
-| `lambda_depth` | `0.1` | Log-depth loss weight; `0` = disabled |
-| `depth_min_conf` | `0.3` | Mask depth loss where MASt3R confidence is below this |
+| `online_enabled` | `false` | Enable online GS worker (recommended) |
+| `enabled` | `false` | Enable offline batch GS after SLAM |
+
+### Shared safety / optimizer controls
+
+| Key | Default | Description |
+|---|---|---|
+| `c_conf_threshold` | `0.5` | Confidence gate for Gaussian initialization |
+| `max_gaussians` | `2000000` | Global Gaussian cap |
+| `lr_means` | `1.6e-4` | LR for means |
+| `lr_opacity` | `5.0e-2` | LR for opacity |
+| `lr_scales` | `5.0e-3` | LR for log-scales |
+| `lr_quats` | `1.0e-3` | LR for quaternions |
+| `lr_sh` | `2.5e-3` | LR for SH DC color |
+| `densify_from_iter` | `500` | Start densification window |
+| `densify_until_iter` | `5000` | End densification window |
+| `densify_interval` | `100` | Densify every N steps |
+| `opacity_reset_interval` | `3000` | Opacity reset interval |
+| `prune_opacity_thresh` | `0.005` | Opacity pruning threshold |
+| `grad_thresh` | `2.0e-4` | Clone trigger on image-plane gradient |
+
+### Online-specific controls
+
+| Key | Default | Description |
+|---|---|---|
+| `window_size` | `5` | Recent camera count in sliding window |
+| `random_history` | `2` | Random historical camera count |
+| `steps_per_keyframe` | `50` | Coarse train steps when a keyframe arrives |
+| `idle_train_steps` | `5` | Coarse train steps during idle cycles |
+| `max_gaussians_per_kf` | `50000` | Per-keyframe insertion cap |
+| `n_iters_fine` | `2000` | Fine-stage iterations |
+| `fine_log_interval` | `500` | Fine-stage log interval |
+| `fine_prune_thresh` | `0.01` | Pre-fine floater pruning threshold |
+| `alpha_rgb` | `0.95` | RGB-vs-depth mix in paper Eq.13 |
+| `lambda_iso` | `10.0` | Isotropic scale regularization |
+| `lambda_ssim` | `0.0` | D-SSIM blend weight |
+| `disc_z_factor` | `0.1` | Disc initialization z-axis factor |
+| `max_log_scale` | `-2.0` | Upper log-scale clamp |
+| `min_log_scale` | `-7.0` | Lower log-scale clamp |
+| `max_scale_ratio` | `10.0` | Needle-prune ratio cap |
+
+### Offline-specific controls
+
+| Key | Default | Description |
+|---|---|---|
+| `n_iters` | `10000` | Offline training iterations |
+| `lambda_depth` | `0.1` | Depth loss weight |
+| `depth_min_conf` | `0.3` | Depth loss confidence mask threshold |

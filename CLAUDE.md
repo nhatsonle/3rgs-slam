@@ -104,5 +104,5 @@ Configs use YAML inheritance via `inherit:` key. `config/base.yaml` defines all 
 | Trajectory/PLY saving | `mast3r_slam/evaluate.py` |
 | CUDA backend source | `mast3r_slam/backend/src/` |
 
-Don't make any changes to the backbone architecture of MASt3R-SLAM unless having specific requests.
+Don't make any changes to the backbone architecture of MASt3R-SLAM unless you really need (ask me first).
 All new functions related to 3DGS must have control parameter 'threshold' to prevent Gaussians boom.

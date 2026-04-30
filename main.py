@@ -20,6 +20,7 @@ from mast3r_slam.mast3r_utils import (
     mast3r_inference_mono,
 )
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
+from mast3r_slam.online_gaussian_splat import make_keyframe_snapshot, run_online_gs
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
@@ -225,6 +226,23 @@ if __name__ == "__main__":
     backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
     backend.start()
 
+    # ── Online GS worker (paper: decoupled mapping back-end) ─────────────────
+    online_gs_active = (
+        dataset.save_results
+        and config.get("gaussian_splat", {}).get("online_enabled", False)
+    )
+    gs_queue    = None
+    gs_backend  = None
+    if online_gs_active:
+        save_dir_gs, seq_name_gs = eval.prepare_savedir(args, dataset)
+        gs_queue   = manager.Queue()
+        gs_backend = mp.Process(
+            target=run_online_gs,
+            args=(config, states, keyframes, str(save_dir_gs), seq_name_gs, gs_queue),
+        )
+        gs_backend.start()
+        print("[Main] Online GS worker started.")
+
     i = 0
     fps_timer = time.time()
 
@@ -271,6 +289,9 @@ if __name__ == "__main__":
             states.queue_global_optimization(len(keyframes) - 1)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame)
+            # Publish new keyframe to online GS worker
+            if gs_queue is not None:
+                gs_queue.put(make_keyframe_snapshot(len(keyframes) - 1, frame, use_calib))
             realtime_poses.append(frame.T_WC.data.detach().cpu().clone())
             i += 1
             continue
@@ -302,6 +323,9 @@ if __name__ == "__main__":
         if add_new_kf:
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
+            # Publish new keyframe to online GS worker
+            if gs_queue is not None:
+                gs_queue.put(make_keyframe_snapshot(len(keyframes) - 1, frame, use_calib))
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
                 with states.lock:
@@ -343,5 +367,14 @@ if __name__ == "__main__":
 
     print("done")
     backend.join()
+
+    # Signal online GS worker to run fine refinement with final poses, then wait.
+    # Termination event is sent AFTER backend.join() so the worker syncs the
+    # globally-optimised poses from the now-finished backend.
+    if online_gs_active and gs_queue is not None:
+        gs_queue.put({"type": "terminate"})
+    if gs_backend is not None:
+        gs_backend.join()
+
     if not args.no_viz:
         viz.join()

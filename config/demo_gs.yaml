@@ -1,13 +1,14 @@
 inherit: "config/base.yaml"
 
 dataset:
-  subsample: 10   # ~120 frames from the 1207-frame video — fast PoC run
+  subsample: 2   # ~600 frames → ~30-40 keyframes, much denser coverage
 
 gaussian_splat:
-  enabled: true
+  # ── Offline batch GS (unchanged) ──────────────────────────────────────────
+  enabled: false          # set true to also run offline GS after SLAM
   c_conf_threshold: 0.5
   max_gaussians: 500000
-  n_iters: 10000
+  n_iters: 3000
   lr_means: 1.6e-4
   lr_opacity: 5.0e-2
   lr_scales: 5.0e-3
@@ -22,3 +23,69 @@ gaussian_splat:
   lambda_ssim: 0.2
   lambda_depth: 0.1
   depth_min_conf: 0.3
+
+  # ── Online GS (MASt3R-GS paper, enabled for demo) ─────────────────────────
+  online_enabled: true
+
+  # Gaussian count caps
+  max_gaussians: 500000
+  max_gaussians_per_kf: 30000  # lower per-kf cap so 30+ keyframes fill the budget
+
+  # Confidence / initialization
+  c_conf_threshold: 0.6        # higher → filter background floaters at init
+
+  # Scale: disc-shaped init + per-step max-axis cap (preserves disc anisotropy).
+  # disc_z_factor: z-axis = in-plane * factor → 0.1 = 10x thinner than surface plane
+  disc_z_factor: 0.1
+  max_log_scale: -2.5   # cap on largest axis; shift-down preserves disc shape
+  min_log_scale: -7.0
+  # Needle pruning: uses s1/s2 criterion (max/second-largest).
+  # Discs [sx,sx,sz≪sx] → s1/s2≈1 → safe. Needles [sL,s,s] → s1/s2>>1 → pruned.
+  max_scale_ratio: 8.0
+
+  # Sliding window
+  window_size: 5
+  random_history: 2
+
+  # Coarse mapping: more steps → better initialization before fine refinement
+  steps_per_keyframe: 100
+  idle_train_steps: 10
+
+  # Fine refinement iterations after SLAM (Stage 2)
+  n_iters_fine: 15000
+  fine_log_interval: 500
+  # Coarse stage: print loss every this many total steps
+  coarse_log_interval: 100
+  # Prune threshold for floater removal before fine stage (higher = more aggressive)
+  fine_prune_thresh: 0.05
+  # SH degree for fine stage (0=constant color, 3=full view-dependent).
+  # SH=3 adds 15 coeffs × 3 channels per Gaussian → ~+3-5 dB PSNR.
+  fine_sh_degree: 3
+  lr_sh_rest: 1.25e-4   # SH rest lr = lr_sh / 20 (start small, view-dep effects are subtle)
+  # Depth loss for fine stage: small weight helps regularize positions.
+  fine_lambda_depth: 0.05
+
+  # Loss weights (paper Eq.13: alpha_rgb·L1 + (1-alpha_rgb)·Ldepth + lambda_iso·Liso)
+  alpha_rgb: 0.8
+  lambda_iso: 0.1          # light penalty only; discs are naturally anisotropic
+  lambda_depth: 0.1        # coarse stage only (overridden to 0 in fine)
+  depth_min_conf: 0.3
+  # D-SSIM complement: 0 = pure L1 (paper); 0.2 = improves perceptual quality
+  lambda_ssim: 0.2
+
+  # Density control
+  # densify_until_iter must be > n_iters_fine so it covers the fine stage
+  # (fine stage resets total_steps to 0, so this window applies fresh)
+  densify_from_iter: 100
+  densify_until_iter: 4000  # covers fine iters + some coarse buffer
+  densify_interval: 100
+  opacity_reset_interval: 999999  # effectively disabled (fine stage also disables)
+  prune_opacity_thresh: 0.005
+  grad_thresh: 2.0e-4
+
+  # Learning rates
+  lr_means: 1.6e-4
+  lr_opacity: 5.0e-2
+  lr_scales: 5.0e-3
+  lr_quats: 1.0e-3
+  lr_sh: 2.5e-3

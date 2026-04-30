@@ -389,6 +389,17 @@ def _prune_mask(data: dict, threshold: float = 0.005) -> torch.Tensor:
     return torch.sigmoid(data["opacity"]).detach() < threshold
 
 
+def _gs_param_keys(data: dict) -> list:
+    """Return ordered list of per-Gaussian parameter keys present in data.
+
+    Always starts with the fixed base keys; appends optional keys (e.g. sh_rest
+    added at fine-refinement stage) if they exist in data.
+    """
+    base = ["means", "sh_dc", "log_scales", "quats", "opacity"]
+    extra = [k for k in ("sh_rest",) if k in data and data[k] is not None]
+    return base + extra
+
+
 def _clone(data: dict, optimizer, mask: torch.Tensor, current_max: int, threshold: int) -> None:
     """Clone Gaussians indicated by mask; respects hard cap `threshold`."""
     n_existing = data["means"].shape[0]
@@ -399,18 +410,15 @@ def _clone(data: dict, optimizer, mask: torch.Tensor, current_max: int, threshol
     n_clone = min(n_clone, allowed)
     clone_idx = mask.nonzero(as_tuple=True)[0][:n_clone]
 
-    param_keys = ["means", "sh_dc", "log_scales", "quats", "opacity"]
     with torch.no_grad():
-        for key in param_keys:
+        for key in _gs_param_keys(data):
             cloned = data[key][clone_idx].detach().clone().requires_grad_(True)
-            # Small position jitter so clones don't sit on top of originals
             if key == "means":
                 jitter = torch.randn_like(cloned) * 0.001
                 cloned = (cloned + jitter).detach().requires_grad_(True)
             new_tensor = torch.cat([data[key], cloned], dim=0).requires_grad_(True)
             old_p = data[key]
             data[key] = new_tensor
-            # Extend Adam state
             state = optimizer.state.pop(old_p, {})
             new_state = {}
             if "exp_avg" in state:
@@ -428,8 +436,7 @@ def _clone(data: dict, optimizer, mask: torch.Tensor, current_max: int, threshol
 
 def _apply_mask(data: dict, optimizer, keep: torch.Tensor) -> None:
     """Compact all per-Gaussian tensors and Adam state to `keep` indices."""
-    param_keys = ["means", "sh_dc", "log_scales", "quats", "opacity"]
-    for key in param_keys:
+    for key in _gs_param_keys(data):
         old_p = data[key]
         new_p = old_p[keep].detach().requires_grad_(True)
         data[key] = new_p
@@ -526,7 +533,8 @@ def _quat_xyzw_to_matrix(q: torch.Tensor) -> torch.Tensor:
 def _save_splat(path: Path, data: dict) -> None:
     """Save Gaussians as a standard 3DGS PLY (compatible with SuperSplat viewer).
 
-    3DGS PLY convention: rot fields are wxyz.
+    3DGS PLY convention: rot fields are wxyz.  SH rest coefficients are saved
+    as f_rest_* fields when present (degree 1-3 view-dependent color).
     """
     from plyfile import PlyData, PlyElement
 
@@ -544,13 +552,27 @@ def _save_splat(path: Path, data: dict) -> None:
         ("scale_0","f4"), ("scale_1","f4"), ("scale_2","f4"),
         ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3","f4"),
     ]
+
+    # Include SH rest coefficients if available (standard 3DGS PLY format)
+    sh_rest_np = None
+    if data.get("sh_rest") is not None:
+        sh_rest_np = data["sh_rest"].detach().cpu().float().numpy()  # (N, n_rest, 3)
+        n_rest = sh_rest_np.shape[1]
+        for i in range(n_rest):
+            for c in range(3):
+                dtype.append((f"f_rest_{i * 3 + c}", "f4"))
+
     arr = np.empty(N, dtype=dtype)
     arr["x"],       arr["y"],       arr["z"]       = means.T
     arr["f_dc_0"],  arr["f_dc_1"],  arr["f_dc_2"]  = sh_dc.T
     arr["opacity"]                                 = opacity
     arr["scale_0"], arr["scale_1"], arr["scale_2"] = log_scales.T
-    # rot_0=w, rot_1=x, rot_2=y, rot_3=z  (wxyz → standard 3DGS PLY layout)
-    arr["rot_0"], arr["rot_1"], arr["rot_2"], arr["rot_3"] = quats.T  # already wxyz
+    arr["rot_0"], arr["rot_1"], arr["rot_2"], arr["rot_3"] = quats.T
+
+    if sh_rest_np is not None:
+        for i in range(sh_rest_np.shape[1]):
+            for c in range(3):
+                arr[f"f_rest_{i * 3 + c}"] = sh_rest_np[:, i, c]
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

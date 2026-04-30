@@ -21,7 +21,7 @@ tracking:
   rel_error: 1e-3
   delta_norm: 1e-3
   huber: 1.345
-  match_frac_thresh: 0.333
+  match_frac_thresh: 0.7
   sigma_ray: 0.003
   sigma_dist: 1e+1
   sigma_pixel: 1.0
@@ -58,6 +58,7 @@ reloc:
   strict: True
 
 gaussian_splat:
+  # ── Offline batch reconstruction (original mode) ──────────────────────────
   enabled: false
   # Confidence gate for Gaussian initialisation (0–1).
   # Raise to create fewer Gaussians; lower for denser coverage.
@@ -79,7 +80,40 @@ gaussian_splat:
   opacity_reset_interval: 3000
   prune_opacity_thresh: 0.005
   grad_thresh: 2.0e-4
-  # Loss weights
+  # Loss weights (offline path)
   lambda_ssim: 0.2       # weight of D-SSIM term; 0 = pure L1
   lambda_depth: 0.1      # weight of log-depth loss; 0 = disabled
   depth_min_conf: 0.3    # ignore depth loss where MASt3R confidence is below this
+
+  # ── Online incremental reconstruction (MASt3R-GS paper mode) ─────────────
+  online_enabled: false
+  # Sliding window: W most-recent + R random historical cameras per step
+  window_size: 5
+  random_history: 2
+  # Coarse mapping: Adam steps fired immediately after a new keyframe arrives
+  steps_per_keyframe: 50
+  # Idle training steps between keyframe events
+  idle_train_steps: 5
+  # Per-keyframe Gaussian insertion cap (prevents single-keyframe memory spike)
+  max_gaussians_per_kf: 50000
+  # Fine refinement iterations run after SLAM terminates (Stage 2)
+  n_iters_fine: 2000
+  fine_log_interval: 500
+  # Online loss weights (paper Eq.13):
+  #   L = alpha_rgb * L1_rgb + (1-alpha_rgb) * L_depth + lambda_iso * L_iso
+  #   When lambda_ssim > 0, L1_rgb is blended with D-SSIM (improves perceptual quality)
+  alpha_rgb: 0.95        # paper default: 0.95
+  lambda_iso: 10.0       # isotropic scale regularisation (paper: 10); lower = more elongated
+  lambda_ssim: 0.0       # D-SSIM weight; 0 = pure L1 matching paper; 0.2 = better perceptual
+  # lambda_depth and depth_min_conf are shared with the offline path above
+
+  # Gaussian scale bounds for initialization (log-space, world units)
+  # log_scale -3 → ~0.05;  -2 → ~0.14;  -1 → ~0.37 world units
+  disc_z_factor: 0.1     # z-axis init = in-plane * factor → disc-shaped Gaussians
+  max_log_scale: -2.0    # cap on largest axis (shift-down preserves disc anisotropy)
+  min_log_scale: -7.0    # floor prevents degenerate near-zero Gaussians
+  max_scale_ratio: 10.0  # needle pruning: s1/s2 > this → remove (discs s1/s2≈1 are safe)
+
+  # Fine refinement controls
+  fine_prune_thresh: 0.01 # opacity threshold for floater pruning before fine stage
+                          # higher = more aggressive pruning

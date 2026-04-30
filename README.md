@@ -51,6 +51,8 @@ cd MASt3R-SLAM/
 pip install -e thirdparty/mast3r
 pip install -e thirdparty/in3d
 pip install --no-build-isolation -e .
+pip install gsplat
+pip install plyfile
  
 
 # Optionally install torchcodec for faster mp4 loading
@@ -93,6 +95,28 @@ If the calibration parameters are known, you can specify them in intrinsics.yaml
 python main.py --dataset <path/to/video>.mp4 --config config/base.yaml --calib config/intrinsics.yaml
 python main.py --dataset <path/to/folder> --config config/base.yaml --calib config/intrinsics.yaml
 ```
+
+## Online 3DGS Mapping (recommended)
+This repository supports online incremental 3D Gaussian Splatting as the primary mapping mode.
+
+### Quick demo (headless)
+```
+python main.py --dataset IMG_2520.mp4 --config config/demo_gs.yaml --no-viz --save-as gs_demo
+```
+
+### Evaluation profile (headless)
+```
+python main.py --dataset datasets/tum/rgbd_dataset_freiburg1_room/ --config config/eval_gs.yaml --no-viz --save-as gs_eval
+```
+
+### Config switches
+Under `gaussian_splat`:
+- `online_enabled: true` enables online GS worker (recommended).
+- `enabled: true` enables legacy offline batch GS after SLAM (optional fallback).
+
+### Outputs
+- Online GS output: `<save_dir>/<seq_name>_online_gs.ply`
+- Offline GS output: `<save_dir>/<seq_name>_gs.ply`
 
 ## Downloading Dataset
 ### TUM-RGBD Dataset
