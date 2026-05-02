@@ -106,3 +106,4 @@ Configs use YAML inheritance via `inherit:` key. `config/base.yaml` defines all 
 
 Don't make any changes to the backbone architecture of MASt3R-SLAM unless you really need (ask me first).
 All new functions related to 3DGS must have control parameter 'threshold' to prevent Gaussians boom.
+All big changes on system architecture, especially Gaussian Splatting-related parts, must be reflected on the doc folder and a new commit to this "remake" branch.

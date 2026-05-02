@@ -42,6 +42,10 @@ gaussian_splat:
   # Needle pruning: uses s1/s2 criterion (max/second-largest).
   # Discs [sx,sx,sz≪sx] → s1/s2≈1 → safe. Needles [sL,s,s] → s1/s2>>1 → pruned.
   max_scale_ratio: 8.0
+  # Confidence-modulated scale: blurry/uncertain regions get larger Gaussians
+  # for broader coverage; sharp/high-conf regions keep tight scale for fine detail.
+  scale_conf_boost: 2.5  # low-conf pixels get up to 2.5× larger scale at init
+  scale_conf_gamma: 2.0  # quadratic falloff: only low-conf (<~0.5) regions get boosted
 
   # Sliding window
   window_size: 5
@@ -52,7 +56,7 @@ gaussian_splat:
   idle_train_steps: 10
 
   # Fine refinement iterations after SLAM (Stage 2)
-  n_iters_fine: 15000
+  n_iters_fine: 5000
   fine_log_interval: 500
   # Coarse stage: print loss every this many total steps
   coarse_log_interval: 100

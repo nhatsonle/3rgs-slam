@@ -21,6 +21,11 @@ gaussian_splat:
   max_log_scale: -2.5           # cap on largest axis (preserves disc shape via shift-down)
   min_log_scale: -7.0
   max_scale_ratio: 8.0          # needle: s1/s2 > 8 → remove (discs s1/s2≈1 are safe)
+  
+  # Confidence-modulated scale: blurry/uncertain regions get larger Gaussians
+  # for broader coverage; sharp/high-conf regions keep tight scale for fine detail.
+  scale_conf_boost: 2.5  # low-conf pixels get up to 2.5× larger scale at init
+  scale_conf_gamma: 2.0  # quadratic falloff: only low-conf (<~0.5) regions get boosted
 
   # ── Coarse mapping (Stage 1) ──────────────────────────────────────────────
   window_size: 5                # W most-recent cameras per step

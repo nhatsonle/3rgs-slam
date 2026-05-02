@@ -113,6 +113,11 @@ gaussian_splat:
   max_log_scale: -2.0    # cap on largest axis (shift-down preserves disc anisotropy)
   min_log_scale: -7.0    # floor prevents degenerate near-zero Gaussians
   max_scale_ratio: 10.0  # needle pruning: s1/s2 > this → remove (discs s1/s2≈1 are safe)
+  # Confidence-modulated scale: low-confidence regions get larger Gaussians.
+  # boost(conf=1)=1.0 (unchanged); boost(conf=0)=scale_conf_boost.
+  # Set scale_conf_boost: 1.0 to disable (backward-compatible default).
+  scale_conf_boost: 1.0  # max scale multiplier for zero-confidence pixels; 1.0 = off
+  scale_conf_gamma: 2.0  # curve sharpness; higher = only very-low-conf pixels boosted
 
   # Fine refinement controls
   fine_prune_thresh: 0.01 # opacity threshold for floater pruning before fine stage

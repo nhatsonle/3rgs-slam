@@ -261,18 +261,34 @@ class GaussianMapper:
         dy     = F.pad(X_grid[1:]    - X_grid[:-1],    (0, 0, 0, 0, 0, 1))
         sx     = torch.linalg.norm(dx, dim=-1, keepdim=True).clamp(min=1e-6) * s_scale
         sy     = torch.linalg.norm(dy, dim=-1, keepdim=True).clamp(min=1e-6) * s_scale
+
         # z-axis (surface normal direction) = fraction of in-plane size → disc shape.
-        # disc_z_factor < 1.0 makes Gaussians flat, matching surface priors.
+        # Computed from UNMODIFIED sx/sy so disc_z_factor relationship is preserved
+        # regardless of any per-pixel scale boost applied later.
         disc_z_factor = self.cfg.get("disc_z_factor", 0.1)
         sz = (sx + sy) / 2.0 * disc_z_factor
         log_scales = torch.log(torch.cat([sx, sy, sz], dim=-1)).reshape(-1, 3)
 
-        # Clamp the in-plane axes (x,y) to prevent huge blurry Gaussians.
-        # The z-axis is intentionally kept thin (already set by disc_z_factor).
+        # Global scale bounds: clamp all axes.
         max_log_scale = self.cfg.get("max_log_scale", -2.0)
         min_log_scale = self.cfg.get("min_log_scale", -7.0)
         log_scales[:, :2] = log_scales[:, :2].clamp(min=min_log_scale, max=max_log_scale)
         log_scales[:, 2]  = log_scales[:, 2].clamp(min=min_log_scale)  # z: only floor
+
+        # Confidence-modulated scale boost applied IN LOG-SPACE, AFTER the global cap.
+        # Low-confidence pixels get a relaxed per-pixel cap so the boost is not erased.
+        # Previous design applied boost in linear space BEFORE clamping → neutralised
+        # for any pixel where log(sx*boost) > max_log_scale, i.e. most pixels in practice.
+        # Design: conf=1 → log_boost=0 (no change); conf=0 → log_boost=log(scale_conf_boost).
+        scale_conf_boost = self.cfg.get("scale_conf_boost", 1.0)
+        if scale_conf_boost > 1.0:
+            scale_conf_gamma = self.cfg.get("scale_conf_gamma", 2.0)
+            conf_flat = conf_norm.reshape(-1, 1)                            # (H*W, 1)
+            log_boost = math.log(scale_conf_boost) * (1.0 - conf_flat).pow(scale_conf_gamma)
+            relaxed_cap = max_log_scale + math.log(scale_conf_boost)        # absolute ceiling
+            log_scales[:, :2] = (log_scales[:, :2] + log_boost).clamp(
+                min=min_log_scale, max=relaxed_cap
+            )
 
         # Rotation: align Gaussian disc to local surface normal
         normal = F.normalize(
