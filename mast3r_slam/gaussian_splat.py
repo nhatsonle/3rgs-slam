@@ -11,7 +11,6 @@ number of Gaussians created/kept, preventing memory blowups on long sequences.
 import math
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -202,8 +201,16 @@ def train_gaussian_splat(
         )
         Ks_render = K_fb.unsqueeze(0).expand(n_kf, -1, -1).contiguous()
 
+    # ── Separate params dict (Gaussian tensors only).
+    # strategy functions (check_sanity, step_pre/post_backward) iterate over ALL
+    # keys in params via _update_param_with_optimizer — passing the full data dict
+    # (which also contains gt_images lists, depth_maps lists, Ks/None) would crash
+    # or silently corrupt non-Gaussian tensors. Use a dedicated 5-key sub-dict.
+    _PARAM_KEYS_BASE = ["means", "sh_dc", "scales", "quats", "opacities"]
+    params = {k: data[k] for k in _PARAM_KEYS_BASE}
+
     # ── Per-parameter SelectiveAdam optimisers
-    optimizers = _make_splat_optimizers(data, cfg)
+    optimizers = _make_splat_optimizers(params, cfg)
 
     n_iters            = cfg.get("n_iters",                10_000)
     densify_from       = cfg.get("densify_from_iter",         500)
@@ -227,10 +234,10 @@ def train_gaussian_splat(
         absgrad           = True,
         verbose           = False,
     )
-    strategy.check_sanity(data, optimizers)
+    strategy.check_sanity(params, optimizers)
     strategy_state = strategy.initialize_state()
 
-    print(f"[GS] Training {data['means'].shape[0]:,} Gaussians for {n_iters} iters ...")
+    print(f"[GS] Training {params['means'].shape[0]:,} Gaussians for {n_iters} iters ...")
     print(f"[GS] Image size: {H_img}×{W_img}  |  Keyframes: {n_kf}")
 
     # main.py disables grad globally for SLAM; re-enable for GS optimisation
@@ -248,11 +255,11 @@ def train_gaussian_splat(
 
         # ── Rasterise RGB + camera-z depth in one pass
         render_colors, render_alphas, meta = rasterization(
-            means       = data["means"],
-            quats       = data["quats"],                        # wxyz
-            scales      = torch.exp(data["scales"]),
-            opacities   = torch.sigmoid(data["opacities"]),     # (N,)
-            colors      = data["sh_dc"].unsqueeze(1),           # (N, 1, 3) DC SH
+            means       = params["means"],
+            quats       = params["quats"],                      # wxyz
+            scales      = torch.exp(params["scales"]),
+            opacities   = torch.sigmoid(params["opacities"]),   # (N,)
+            colors      = params["sh_dc"].unsqueeze(1),         # (N, 1, 3) DC SH
             viewmats    = viewmat,
             Ks          = K_i,
             width       = W_img,
@@ -287,18 +294,18 @@ def train_gaussian_splat(
                 ).abs()).mean()
                 loss = loss + lambda_depth * l_depth
 
-        strategy.step_pre_backward(data, optimizers, strategy_state, it, meta)
+        strategy.step_pre_backward(params, optimizers, strategy_state, it, meta)
         loss.backward()
 
         # Gradient clipping: prevents single large step exploding means
         torch.nn.utils.clip_grad_norm_(
-            [data["means"], data["scales"], data["quats"], data["opacities"]],
+            [params["means"], params["scales"], params["quats"], params["opacities"]],
             max_norm=1.0,
         )
 
-        n_before = data["means"].shape[0]
-        strategy.step_post_backward(data, optimizers, strategy_state, it, meta, packed=False)
-        n_after = data["means"].shape[0]
+        n_before = params["means"].shape[0]
+        strategy.step_post_backward(params, optimizers, strategy_state, it, meta, packed=False)
+        n_after = params["means"].shape[0]
 
         # Visibility-aware optimizer step; extend to new size if densification changed count
         if n_after == n_before:
@@ -310,38 +317,38 @@ def train_gaussian_splat(
 
         # ── Keep quats normalised
         with torch.no_grad():
-            data["quats"].data = F.normalize(data["quats"].data, dim=-1)
+            params["quats"].data = F.normalize(params["quats"].data, dim=-1)
 
         # ── Manual opacity reset (DefaultStrategy's built-in is broken due to operator precedence)
         if it > 0 and it % opacity_reset_int == 0:
             with torch.no_grad():
-                data["opacities"].data.fill_(-2.0)               # sigmoid(-2) ≈ 0.12
+                params["opacities"].data.fill_(-2.0)             # sigmoid(-2) ≈ 0.12
             if strategy_state.get("grad2d") is not None:
                 strategy_state["grad2d"].zero_()
                 strategy_state["count"].zero_()
 
         # ── Global Gaussian count cap
-        if data["means"].shape[0] > max_gaussians:
+        if params["means"].shape[0] > max_gaussians:
             with torch.no_grad():
                 keep_idx = torch.topk(
-                    torch.sigmoid(data["opacities"].detach()), max_gaussians
+                    torch.sigmoid(params["opacities"].detach()), max_gaussians
                 ).indices
-                bool_keep = torch.zeros(data["means"].shape[0], dtype=torch.bool, device=device)
+                bool_keep = torch.zeros(params["means"].shape[0], dtype=torch.bool, device=device)
                 bool_keep[keep_idx] = True
-            _apply_mask_params(data, optimizers, bool_keep, strategy_state)
+            _apply_mask_params(params, optimizers, bool_keep, strategy_state)
 
         if it % 500 == 0:
             with torch.no_grad():
                 psnr_val = _psnr(render.detach(), gt)
                 ssim_val = _ssim(render.detach(), gt).item()
-            n_gs = data["means"].shape[0]
+            n_gs = params["means"].shape[0]
             print(
                 f"[GS] iter {it:5d}/{n_iters} | loss {loss.item():.4f} | "
                 f"PSNR {psnr_val:.2f} dB | SSIM {ssim_val:.4f} | N={n_gs:,}"
             )
 
     out_path = save_dir / f"{seq_name}_gs.ply"
-    _export_ply(out_path, data)
+    _export_ply(out_path, params)
     print(f"[GS] Saved → {out_path}")
 
 

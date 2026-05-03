@@ -123,13 +123,6 @@ class GaussianMapper:
         self.conf_maps:  List[torch.Tensor]            = []  # (H,W) cpu, normalised
         self.Ks_list:    List[Optional[torch.Tensor]]  = []  # (3,3) cpu or None
 
-        # Per-camera appearance compensation: render_out = ac * render + bc
-        # Handles exposure/white-balance drift across keyframes.
-        # These are training-only parameters — NOT saved to the PLY.
-        self.app_scale: List[torch.Tensor] = []   # per-cam (3,), init ones
-        self.app_bias:  List[torch.Tensor] = []   # per-cam (3,), init zeros
-        self.app_optimizer: Optional[torch.optim.Adam] = None
-
         # Gaussian parameters (None until first keyframe)
         self.data: Dict[str, Optional[torch.Tensor]] = {k: None for k in PARAM_KEYS}
         self.optimizers:    Optional[Dict[str, object]] = None
@@ -147,6 +140,7 @@ class GaussianMapper:
 
     def _get_K(self, cam_idx: int) -> torch.Tensor:
         """Return (1, 3, 3) intrinsic tensor on self.device for cam_idx."""
+        """Return (1, 3, 3) intrinsic tensor on self.device for cam_idx."""
         k = self.Ks_list[cam_idx]
         if k is not None:
             return k.to(self.device).unsqueeze(0)
@@ -158,18 +152,6 @@ class GaussianMapper:
             device=self.device,
         )
         return K_fb.unsqueeze(0)
-
-    def _rebuild_app_optimizer(self) -> None:
-        """Rebuild appearance optimizer from current app_scale / app_bias lists."""
-        if not self.cfg.get("appearance_compensation", False) or not self.app_scale:
-            return
-        lr_scale = self.cfg.get("app_lr_scale", 1e-3)
-        lr_bias  = self.cfg.get("app_lr_bias",  1e-4)
-        params = [
-            {"params": self.app_scale, "lr": lr_scale},
-            {"params": self.app_bias,  "lr": lr_bias},
-        ]
-        self.app_optimizer = torch.optim.Adam(params, eps=1e-15)
 
     def _extend_gaussians(self, new_gs: Dict[str, torch.Tensor]) -> None:
         """
