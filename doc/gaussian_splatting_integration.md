@@ -117,6 +117,59 @@ These are the key controls preventing Gaussian boom.
 
 ---
 
+## Per-camera appearance compensation
+
+When `appearance_compensation: true` is set in the GS config, each keyframe gets a
+learnable per-camera affine color correction applied during training:
+
+```
+render_corrected = ac_i * render + bc_i     # (H,W,3) element-wise
+```
+
+- `ac_i` (scale) initialized to ones, clamped to [0.2, 5.0], lr = `app_lr_scale` (1e-3)
+- `bc_i` (bias)  initialized to zeros, clamped to [-0.5, 0.5], lr = `app_lr_bias` (1e-4)
+- Separate Adam optimizer from the main GS optimizer
+- **Training-only**: ac/bc are NOT saved to the PLY file and do not affect renders at inference
+
+This handles exposure and white-balance drift across keyframes, which would otherwise
+force GS to fit an averaged illumination model and limit PSNR.
+
+Recommended config: `appearance_compensation: true` with `config/calib_gs.yaml`.
+
+---
+
+## Calibrated intrinsics config
+
+`config/calib_gs.yaml` inherits `config/calib.yaml` (sets `use_calib: True`) and enables
+online GS. Using calibrated intrinsics means:
+- Real camera K is stored per-keyframe in `snap["K"]`
+- `GaussianMapper._get_K()` returns real K instead of fallback `f=max(H,W)`
+- Depth constraint (`constrain_points_to_ray`) uses correct projection
+
+This avoids ~22% focal length error for Kinect-based datasets (7-scenes, TUM-RGBD).
+
+---
+
+## Evaluation
+
+`scripts/eval_gs_psnr.py` evaluates PSNR/SSIM from a run log directory.
+
+```bash
+# With calibration (recommended for 7-scenes / TUM)
+python scripts/eval_gs_psnr.py logs/run_dir --calib config/calib_gs.yaml
+
+# Explicit intrinsics
+python scripts/eval_gs_psnr.py logs/run_dir --fx 525 --fy 525 --cx 319.5 --cy 239.5
+
+# Save per-camera renders for qualitative inspection
+python scripts/eval_gs_psnr.py logs/run_dir --calib ... --save-renders renders/
+
+# Save per-camera PSNR/SSIM to CSV
+python scripts/eval_gs_psnr.py logs/run_dir --calib ... --output-csv results.csv
+```
+
+---
+
 ## Output files
 
 - Online output: `<save_dir>/<seq_name>_online_gs.ply` (primary)

@@ -3,14 +3,23 @@ Evaluate rendering quality (PSNR / SSIM) of a saved online-GS PLY.
 
 Usage:
     python scripts/eval_gs_psnr.py logs/7scenes/chess1
+    python scripts/eval_gs_psnr.py logs/7scenes/chess1 --calib config/calib.yaml
+    python scripts/eval_gs_psnr.py logs/7scenes/chess1 --fx 525 --fy 525 --cx 319.5 --cy 239.5
+    python scripts/eval_gs_psnr.py logs/7scenes/chess1 --save-renders renders/ --output-csv results.csv
 
 The run directory must contain:
     <seq>.txt               — TUM-format trajectory (from SLAM)
     <seq>_online_gs.ply     — Gaussian Splat map
     keyframes/<seq>/*.png   — keyframe images saved during SLAM
+
+Intrinsics priority:
+    1. --fx/fy/cx/cy flags (explicit)
+    2. --calib <yaml> file  (fx, fy, cx, cy keys)
+    3. fallback: f = max(H, W), cx = W/2, cy = H/2
 """
 
 import argparse
+import csv
 import math
 import sys
 from pathlib import Path
@@ -35,7 +44,6 @@ def _load_traj(traj_path: Path) -> dict:
         ts = parts[0]
         tx, ty, tz = float(parts[1]), float(parts[2]), float(parts[3])
         qx, qy, qz, qw = float(parts[4]), float(parts[5]), float(parts[6]), float(parts[7])
-        # Build 4×4 T_WC
         x, y, z, w = qx, qy, qz, qw
         R = np.array([
             [1 - 2*(y*y + z*z),   2*(x*y - w*z),   2*(x*z + w*y)],
@@ -64,7 +72,6 @@ def _load_ply(ply_path: Path, device: str = "cuda") -> dict:
                                dtype=torch.float32, device=device)   # wxyz
     opacity    = torch.tensor(v["opacity"], dtype=torch.float32, device=device)  # logit
 
-    # Optional SH rest coefficients
     names = {p.name for p in v.properties}
     rest_fields = sorted([n for n in names if n.startswith("f_rest_")],
                          key=lambda n: int(n.split("_")[-1]))
@@ -111,6 +118,18 @@ def _gaussian_kernel(size, sigma, device, dtype):
     return k.contiguous()
 
 
+def _load_calib_yaml(path: Path) -> dict:
+    """Parse a YAML calibration file for fx, fy, cx, cy."""
+    import yaml
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    # Support both flat keys and nested under 'camera' or 'intrinsics'
+    for section in [data, data.get("camera", {}), data.get("intrinsics", {})]:
+        if section and "fx" in section:
+            return {k: float(section[k]) for k in ("fx", "fy", "cx", "cy")}
+    raise ValueError(f"Could not find fx/fy/cx/cy in {path}")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -119,6 +138,22 @@ def main():
     parser.add_argument("--device", default="cuda", help="cuda or cpu")
     parser.add_argument("--max-cams", type=int, default=0,
                         help="Evaluate on at most N cameras (0 = all)")
+
+    # Intrinsics — explicit flags override calib YAML; both override fallback
+    intrinsics_grp = parser.add_argument_group("intrinsics (override fallback f=max(H,W))")
+    intrinsics_grp.add_argument("--calib", type=Path, default=None,
+                                help="Path to calibration YAML with fx/fy/cx/cy keys")
+    intrinsics_grp.add_argument("--fx",  type=float, default=None)
+    intrinsics_grp.add_argument("--fy",  type=float, default=None)
+    intrinsics_grp.add_argument("--cx",  type=float, default=None)
+    intrinsics_grp.add_argument("--cy",  type=float, default=None)
+
+    # Output options
+    parser.add_argument("--save-renders", type=Path, default=None,
+                        help="Directory to save rendered PNG images for qualitative inspection")
+    parser.add_argument("--output-csv", type=Path, default=None,
+                        help="Write per-camera PSNR/SSIM to this CSV file")
+
     args = parser.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -157,12 +192,11 @@ def main():
     # Match keyframe images → poses by timestamp
     matched = []
     for img_path in kf_images:
-        ts = img_path.stem  # e.g. "38.0"
+        ts = img_path.stem
         pose = poses.get(ts)
         if pose is None:
             pose = poses.get(ts.split(".")[0])
         if pose is None:
-            # Try approximate match (float comparison)
             ts_f = float(ts)
             best, best_d = None, 1e9
             for k, v in poses.items():
@@ -181,18 +215,36 @@ def main():
         print("[ERROR] Could not match any keyframe images to trajectory poses."); sys.exit(1)
     print(f"Matched {len(matched)} keyframe images to poses")
 
-    # Optional camera limit
     if args.max_cams > 0 and len(matched) > args.max_cams:
         step = len(matched) // args.max_cams
         matched = matched[::step][:args.max_cams]
         print(f"Evaluating on {len(matched)} cameras (--max-cams)")
 
-    # Rendering
+    # ── Resolve intrinsics ────────────────────────────────────────────────────
+    # Detect image size from first image for fallback K
+    _first_img = np.array(Image.open(matched[0][0]).convert("RGB"))
+    H_ref, W_ref = _first_img.shape[:2]
+
+    override_K: dict | None = None
+    if args.fx is not None:
+        override_K = {"fx": args.fx, "fy": args.fy or args.fx,
+                      "cx": args.cx or W_ref / 2.0, "cy": args.cy or H_ref / 2.0}
+        print(f"Intrinsics : explicit flags  fx={override_K['fx']}  fy={override_K['fy']}  "
+              f"cx={override_K['cx']}  cy={override_K['cy']}")
+    elif args.calib is not None:
+        override_K = _load_calib_yaml(args.calib)
+        print(f"Intrinsics : {args.calib.name}  fx={override_K['fx']}  fy={override_K['fy']}  "
+              f"cx={override_K['cx']}  cy={override_K['cy']}")
+    else:
+        f_fb = float(max(H_ref, W_ref))
+        print(f"Intrinsics : fallback  f={f_fb}  cx={W_ref/2.0}  cy={H_ref/2.0}  "
+              f"(pass --calib or --fx for better accuracy)")
+
+    # ── Rendering setup ───────────────────────────────────────────────────────
     from gsplat import rasterization
 
-    # Prepare Gaussian tensors
     means      = gs["means"]
-    quats      = F.normalize(gs["quats"], dim=-1)       # wxyz
+    quats      = F.normalize(gs["quats"], dim=-1)
     scales     = torch.exp(gs["log_scales"])
     opacities  = torch.sigmoid(gs["opacity"])
     if gs["sh_rest"] is not None:
@@ -203,24 +255,31 @@ def main():
         sh_degree = 0
     print(f"SH degree  : {sh_degree}")
 
+    # Output dirs/files
+    if args.save_renders:
+        args.save_renders.mkdir(parents=True, exist_ok=True)
+    csv_rows = []
+
     psnr_list, ssim_list = [], []
 
     for i, (img_path, T_WC) in enumerate(matched):
-        # Load GT image
         gt_np = np.array(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
         H, W  = gt_np.shape[:2]
         gt    = torch.tensor(gt_np, device=args.device)
 
-        # Build K (fallback: pinhole with f=max(H,W))
-        f     = float(max(H, W))
-        K_arr = np.array([[f, 0, W/2], [0, f, H/2], [0, 0, 1]], dtype=np.float32)
-        K     = torch.tensor(K_arr, device=args.device).unsqueeze(0)
+        # Build K
+        if override_K is not None:
+            K_arr = np.array([[override_K["fx"], 0, override_K["cx"]],
+                              [0, override_K["fy"], override_K["cy"]],
+                              [0, 0, 1]], dtype=np.float32)
+        else:
+            f = float(max(H, W))
+            K_arr = np.array([[f, 0, W/2], [0, f, H/2], [0, 0, 1]], dtype=np.float32)
+        K = torch.tensor(K_arr, device=args.device).unsqueeze(0)
 
-        # Build w2c viewmat
         T_CW   = np.linalg.inv(T_WC)
         viewmat = torch.tensor(T_CW, dtype=torch.float32, device=args.device).unsqueeze(0)
 
-        # Render
         with torch.no_grad():
             out, _, _ = rasterization(
                 means=means, quats=quats, scales=scales, opacities=opacities,
@@ -234,9 +293,15 @@ def main():
         s = _ssim_simple(render, gt)
         psnr_list.append(p)
         ssim_list.append(s)
+        csv_rows.append({"frame": img_path.name, "psnr": p, "ssim": s})
 
         if (i + 1) % max(1, len(matched) // 10) == 0 or i == len(matched) - 1:
             print(f"  [{i+1:3d}/{len(matched)}] PSNR {p:.2f} dB  SSIM {s:.4f}  ({img_path.name})")
+
+        if args.save_renders:
+            render_np = (render.cpu().numpy() * 255).astype(np.uint8)
+            side = np.concatenate([gt_np * 255, render_np], axis=1).astype(np.uint8)
+            Image.fromarray(side).save(args.save_renders / f"{i:04d}_{img_path.stem}.png")
 
     mean_psnr = np.mean(psnr_list)
     mean_ssim = np.mean(ssim_list)
@@ -247,6 +312,22 @@ def main():
     print(f"  PSNR   : {mean_psnr:.3f} dB  (std {np.std(psnr_list):.2f})")
     print(f"  SSIM   : {mean_ssim:.4f}  (std {np.std(ssim_list):.4f})")
     print(f"{'='*50}")
+
+    # PSNR histogram (quick distribution overview)
+    bins = [0, 15, 20, 22, 24, 26, 30, 100]
+    counts, _ = np.histogram(psnr_list, bins=bins)
+    print("  PSNR distribution:")
+    for lo, hi, c in zip(bins[:-1], bins[1:], counts):
+        bar = "█" * c
+        print(f"    {lo:3d}–{hi:3d} dB : {bar} ({c})")
+
+    if args.output_csv:
+        with open(args.output_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["frame", "psnr", "ssim"])
+            writer.writeheader()
+            writer.writerows(csv_rows)
+            writer.writerow({"frame": "MEAN", "psnr": mean_psnr, "ssim": mean_ssim})
+        print(f"\nCSV saved → {args.output_csv}")
 
 
 if __name__ == "__main__":

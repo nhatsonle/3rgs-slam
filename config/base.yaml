@@ -122,3 +122,11 @@ gaussian_splat:
   # Fine refinement controls
   fine_prune_thresh: 0.01 # opacity threshold for floater pruning before fine stage
                           # higher = more aggressive pruning
+
+  # Per-camera appearance compensation (training-only affine color model)
+  # render_out = ac * render + bc;  ac/bc are NOT saved to the PLY file.
+  # Handles exposure / white-balance drift across keyframes.
+  # Set to false for backward-compatible behaviour.
+  appearance_compensation: false
+  app_lr_scale: 1.0e-3   # Adam lr for scale (ac) parameters
+  app_lr_bias:  1.0e-4   # Adam lr for bias (bc) parameters

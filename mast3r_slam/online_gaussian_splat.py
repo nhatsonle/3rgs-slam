@@ -124,10 +124,22 @@ class GaussianMapper:
         self.conf_maps:  List[torch.Tensor]            = []  # (H,W) cpu, normalised
         self.Ks_list:    List[Optional[torch.Tensor]]  = []  # (3,3) cpu or None
 
+        # Per-camera appearance compensation: render_out = ac * render + bc
+        # Handles exposure/white-balance drift across keyframes.
+        # These are training-only parameters — NOT saved to the PLY.
+        self.app_scale: List[torch.Tensor] = []   # per-cam (3,), init ones
+        self.app_bias:  List[torch.Tensor] = []   # per-cam (3,), init zeros
+        self.app_optimizer: Optional[torch.optim.Adam] = None
+
         # Gaussian parameters (None until first keyframe)
         self.data: Dict[str, Optional[torch.Tensor]] = {k: None for k in PARAM_KEYS}
         self.optimizer:         Optional[torch.optim.Adam] = None
         self.absgrad_accum:     Optional[torch.Tensor]     = None
+
+        # Per-Gaussian visibility counter — counts how many renders included each Gaussian.
+        # Accumulated from rasterization radii (radii > 0 means visible).
+        # Never reset between density intervals; used to detect persistent floaters.
+        self.floater_vis_accum: Optional[torch.Tensor] = None
 
         self.n_kf:        int            = 0
         self.total_steps: int            = 0
@@ -160,6 +172,18 @@ class GaussianMapper:
         )
         return K_fb.unsqueeze(0)
 
+    def _rebuild_app_optimizer(self) -> None:
+        """Rebuild appearance optimizer from current app_scale / app_bias lists."""
+        if not self.cfg.get("appearance_compensation", False) or not self.app_scale:
+            return
+        lr_scale = self.cfg.get("app_lr_scale", 1e-3)
+        lr_bias  = self.cfg.get("app_lr_bias",  1e-4)
+        params = [
+            {"params": self.app_scale, "lr": lr_scale},
+            {"params": self.app_bias,  "lr": lr_bias},
+        ]
+        self.app_optimizer = torch.optim.Adam(params, eps=1e-15)
+
     def _extend_gaussians(self, new_gs: Dict[str, torch.Tensor]) -> None:
         """
         Append new Gaussian primitives to the existing state dict and
@@ -190,6 +214,13 @@ class GaussianMapper:
         # Extend abs-grad accumulator
         pad_acc = torch.zeros(n_new, device=self.device)
         self.absgrad_accum = torch.cat([self.absgrad_accum, pad_acc])
+
+        # Extend visibility accumulator (new Gaussians start with zero visibility)
+        if self.floater_vis_accum is not None:
+            self.floater_vis_accum = torch.cat([
+                self.floater_vis_accum,
+                torch.zeros(n_new, device=self.device),
+            ])
 
     # ── Tracking-Mapping Interface: depth generation ──────────────────────────
 
@@ -360,8 +391,9 @@ class GaussianMapper:
             # Bootstrap: first keyframe initialises state and optimiser
             for k in PARAM_KEYS:
                 self.data[k] = new_gs[k].to(self.device).requires_grad_(True)
-            self.optimizer     = self._make_optimizer()
-            self.absgrad_accum = torch.zeros(new_gs["means"].shape[0], device=self.device)
+            self.optimizer          = self._make_optimizer()
+            self.absgrad_accum      = torch.zeros(new_gs["means"].shape[0], device=self.device)
+            self.floater_vis_accum  = torch.zeros(new_gs["means"].shape[0], device=self.device)
         else:
             self._extend_gaussians(new_gs)
 
@@ -376,6 +408,17 @@ class GaussianMapper:
             bool_keep[keep] = True
             _apply_mask(self.data, self.optimizer, bool_keep)
             self.absgrad_accum = self.absgrad_accum[bool_keep]
+            if self.floater_vis_accum is not None:
+                self.floater_vis_accum = self.floater_vis_accum[bool_keep]
+
+        # Register per-camera appearance parameters (if enabled)
+        if self.cfg.get("appearance_compensation", False):
+            ac = torch.ones(3,  device=self.device, requires_grad=True)
+            bc = torch.zeros(3, device=self.device, requires_grad=True)
+            self.app_scale.append(ac)
+            self.app_bias.append(bc)
+            # Rebuild optimizer so new params are included
+            self._rebuild_app_optimizer()
 
         self.n_kf += 1
 
@@ -485,6 +528,13 @@ class GaussianMapper:
             if render.grad_fn is None:
                 continue
 
+            # Per-camera appearance compensation: render_out = ac * render + bc
+            # Handles exposure/WB drift across keyframes; ac/bc are training-only.
+            if cfg.get("appearance_compensation", False) and cam_idx < len(self.app_scale):
+                ac = self.app_scale[cam_idx]   # (3,) broadcast over H,W
+                bc = self.app_bias[cam_idx]    # (3,)
+                render = (render * ac + bc).clamp(0.0, 1.0)
+
             # L_rgb: L1 + optional D-SSIM (paper Eq.10 is pure L1; SSIM improves
             # perceptual quality when lambda_ssim > 0 in config)
             l_rgb     = (render - gt).abs().mean()
@@ -522,6 +572,8 @@ class GaussianMapper:
             acc["n_steps"] += 1
 
             self.optimizer.zero_grad(set_to_none=True)
+            if self.app_optimizer is not None:
+                self.app_optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
             # Accumulate abs-2D gradient for densification
@@ -529,6 +581,15 @@ class GaussianMapper:
                 self.absgrad_accum += (
                     meta["means2d"].absgrad.squeeze(0).norm(dim=-1).detach()
                 )
+
+            # Accumulate per-Gaussian visibility (radii > 0 ↔ Gaussian projected to screen)
+            # meta["radii"] shape varies by gsplat version: (C,N), (C,N,2), or (N,).
+            # Collapse all dims after the first (Gaussian) dim before comparing.
+            if self.floater_vis_accum is not None and "radii" in meta and meta["radii"] is not None:
+                radii = meta["radii"].squeeze(0).detach()          # (N,) or (N, 2)
+                vis   = (radii.reshape(radii.shape[0], -1).abs().sum(dim=-1) > 0).float()  # (N,)
+                if vis.shape[0] == self.floater_vis_accum.shape[0]:
+                    self.floater_vis_accum += vis
 
             torch.nn.utils.clip_grad_norm_(
                 [
@@ -540,9 +601,15 @@ class GaussianMapper:
                 max_norm=1.0,
             )
             self.optimizer.step()
+            if self.app_optimizer is not None:
+                self.app_optimizer.step()
 
             with torch.no_grad():
                 self.data["quats"].data = F.normalize(self.data["quats"].data, dim=-1)
+                # Keep appearance params in a sane range to prevent color inversion
+                if cfg.get("appearance_compensation", False) and cam_idx < len(self.app_scale):
+                    self.app_scale[cam_idx].data.clamp_(0.2, 5.0)
+                    self.app_bias[cam_idx].data.clamp_(-0.5, 0.5)
                 ls = self.data["log_scales"].data
                 # Floor all axes to prevent degenerate near-zero Gaussians.
                 ls.clamp_(min=min_log_scale)
@@ -574,9 +641,23 @@ class GaussianMapper:
                     sorted_s = scales.sort(dim=-1, descending=True).values         # s1>=s2>=s3
                     needle_ratio = sorted_s[:, 0] / sorted_s[:, 1].clamp(min=1e-6)
                     prune_mask = prune_mask | (needle_ratio > max_scale_ratio)
+
+                # Visibility-based floater pruning: Gaussians that are never projected
+                # onto any camera plane accumulate zero visibility → persistent floaters.
+                # Only active after enough renders to give real Gaussians a chance to appear.
+                min_vis_rate = cfg.get("min_vis_rate", 0.0)
+                if (min_vis_rate > 0 and self.floater_vis_accum is not None
+                        and s > densify_from + densify_int * 3
+                        and self.floater_vis_accum.shape[0] == prune_mask.shape[0]):
+                    vis_per_step = self.floater_vis_accum / max(s, 1)
+                    floater_mask = vis_per_step < min_vis_rate
+                    prune_mask   = prune_mask | floater_mask
+
                 if prune_mask.any():
                     _apply_mask(self.data, self.optimizer, ~prune_mask)
                     self.absgrad_accum = self.absgrad_accum[~prune_mask]
+                    if self.floater_vis_accum is not None:
+                        self.floater_vis_accum = self.floater_vis_accum[~prune_mask]
 
                 if self.absgrad_accum.shape[0] == self.data["means"].shape[0]:
                     clone_mask = (self.absgrad_accum / max(s, 1)) > grad_thresh
@@ -590,6 +671,11 @@ class GaussianMapper:
                             self.absgrad_accum,
                             torch.zeros(extra, device=self.device),
                         ])
+                        if self.floater_vis_accum is not None:
+                            self.floater_vis_accum = torch.cat([
+                                self.floater_vis_accum,
+                                torch.zeros(extra, device=self.device),
+                            ])
                 self.absgrad_accum.zero_()
 
         return acc
@@ -653,6 +739,8 @@ class GaussianMapper:
             _apply_mask(self.data, self.optimizer, ~prune_mask)
             # absgrad_accum will be reset below; shrink it first so shapes match
             self.absgrad_accum = self.absgrad_accum[~prune_mask]
+            if self.floater_vis_accum is not None:
+                self.floater_vis_accum = self.floater_vis_accum[~prune_mask]
             print(
                 f"[OnlineGS] Initial prune removed {prune_mask.sum().item():,} floaters → "
                 f"{self.data['means'].shape[0]:,} remaining"
@@ -662,7 +750,8 @@ class GaussianMapper:
         # Coarse mapping leaves total_steps >> densify_until_iter, so densification
         # would never trigger without this reset.
         self.total_steps = 0
-        self.absgrad_accum = torch.zeros(self.data["means"].shape[0], device=self.device)
+        self.absgrad_accum     = torch.zeros(self.data["means"].shape[0], device=self.device)
+        self.floater_vis_accum = torch.zeros(self.data["means"].shape[0], device=self.device)
 
         # ── 3. Promote to higher SH degree for view-dependent color ──────────
         # SH degree 0 = constant color → PSNR ceiling ~20 dB.

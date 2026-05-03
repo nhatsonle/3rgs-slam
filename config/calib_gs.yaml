@@ -1,0 +1,89 @@
+inherit: "config/calib.yaml"
+
+# Calibrated intrinsics + high-quality online Gaussian Splatting
+# Goals: map detail matching original MASt3R point cloud, minimal floaters/blur
+# use_calib=True → real K per keyframe → correct projection → no scale ambiguity
+
+gaussian_splat:
+  # ── Offline batch GS (disabled) ──────────────────────────────────────────
+  enabled: false
+
+  # ── Online GS: high-quality calibrated mode ───────────────────────────────
+  online_enabled: true
+
+  # ── Coverage: keep more valid pixels for detail ──────────────────────────
+  # Lower threshold → more Gaussians initialized per keyframe → more detail.
+  # Confidence is normalised [0,1]; 0.3 keeps ~70% of pixels (vs 0.6 = 40%).
+  c_conf_threshold: 0.3
+
+  # ── Gaussian count caps ───────────────────────────────────────────────────
+  # More Gaussians per keyframe = denser coverage = closer to point cloud detail.
+  max_gaussians_per_kf: 40000   # 30 KF × 40K = 1.2M initial; after pruning ≈ 600K–900K
+  max_gaussians: 1000000        # 1M hard cap; ~700 MB params+optimizer vs 1.4 GB for 2M
+
+  # ── Scale: smaller = sharper = more detail ───────────────────────────────
+  # max_log_scale: exp(-3.5) ≈ 0.030 world units (~3cm for metric scenes).
+  # Each Gaussian covers a single surface patch, not a large blurry region.
+  disc_z_factor: 0.1            # z-axis = in-plane * factor → thin disc shape
+  max_log_scale: -3.5           # was -2.5; tighter cap prevents large blobs
+  min_log_scale: -8.0           # deeper floor for fine detail Gaussians
+  max_scale_ratio: 4.0          # was 8.0; aggressive needle pruning
+  scale_conf_boost: 1.5         # modest boost for low-conf pixels (was 2.5)
+  scale_conf_gamma: 2.0
+
+  # ── Regularization: prevent Gaussian bloating ────────────────────────────
+  # Paper default lambda_iso = 10; disc Gaussians need less but 0.1 is too weak.
+  # 3.0 prevents unconstrained growth while allowing natural disc anisotropy.
+  lambda_iso: 3.0               # was 0.1; strong enough to prevent blobs
+
+  # ── Sliding window: larger window = better multi-view consistency ─────────
+  window_size: 8                # was 5; more cameras per training step
+  random_history: 3             # was 2; more historical coverage
+
+  # ── Training: more steps = better convergence per keyframe ───────────────
+  steps_per_keyframe: 200       # was 100; 2× more gradient steps per KF
+  idle_train_steps: 20          # was 10; more training between keyframe events
+
+  # ── Floater detection: prune Gaussians never visible from any camera ──────
+  # min_vis_rate: fraction of total_steps a Gaussian must be visible to survive.
+  # 0.03 = must appear in ≥3% of renders; purely floating Gaussians get pruned.
+  # Only activates after 3× densify_interval steps to give all Gaussians a chance.
+  min_vis_rate: 0.03
+
+  # ── Densification: more aggressive cloning for fine detail ───────────────
+  densify_from_iter: 100
+  densify_until_iter: 5000      # extended to cover more coarse steps
+  densify_interval: 50          # was 100; more frequent → faster detail recovery
+  grad_thresh: 8.0e-5           # was 2.0e-4; lower = clone more Gaussians in sparse regions
+  prune_opacity_thresh: 0.01    # was 0.005; more aggressive opacity pruning
+  opacity_reset_interval: 999999  # effectively disabled
+
+  # ── Fine refinement: thorough global polish ───────────────────────────────
+  n_iters_fine: 10000           # was 5000; thorough final convergence
+  fine_log_interval: 500
+  coarse_log_interval: 100
+  fine_prune_thresh: 0.1        # was 0.05; aggressive floater removal before fine
+  fine_sh_degree: 3             # view-dependent color (adds ~3-5 dB PSNR)
+  lr_sh_rest: 1.25e-4
+  fine_lambda_depth: 0.0        # disable depth in fine stage (cross-Sim3-scale noise)
+
+  # ── Loss weights ──────────────────────────────────────────────────────────
+  alpha_rgb: 0.8
+  lambda_depth: 0.1             # coarse stage: depth helps geometry placement
+  depth_min_conf: 0.3
+  lambda_ssim: 0.2              # SSIM improves perceptual quality
+  # lambda_iso set above (3.0)
+
+  # ── Learning rates ────────────────────────────────────────────────────────
+  lr_means: 1.6e-4
+  lr_opacity: 5.0e-2
+  lr_scales: 5.0e-3
+  lr_quats: 1.0e-3
+  lr_sh: 2.5e-3
+
+  # ── Per-camera appearance compensation ───────────────────────────────────
+  # Learnable affine color model per keyframe (training-only, not saved to PLY).
+  # Handles exposure/WB drift; prevents GS from averaging inconsistent lighting.
+  appearance_compensation: true
+  app_lr_scale: 1.0e-3
+  app_lr_bias: 1.0e-4

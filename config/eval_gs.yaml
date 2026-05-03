@@ -12,11 +12,11 @@ gaussian_splat:
   enabled: false  # disable offline batch GS
 
   # ── Gaussian budget ───────────────────────────────────────────────────────
-  max_gaussians: 1000000        # 1M cap for full sequences (500k too tight)
-  max_gaussians_per_kf: 30000   # per-keyframe insertion cap
+  max_gaussians: 400000        # 1M cap for full sequences (500k too tight)
+  max_gaussians_per_kf: 12000   # per-keyframe insertion cap
 
   # ── Initialization ────────────────────────────────────────────────────────
-  c_conf_threshold: 0.4         # confidence gate for X_canon → lower = denser
+  c_conf_threshold: 0.4       # confidence gate for X_canon → lower = denser
   disc_z_factor: 0.1            # z-axis = in-plane * 0.1 → proper disc init
   max_log_scale: -2.5           # cap on largest axis (preserves disc shape via shift-down)
   min_log_scale: -7.0
