@@ -304,7 +304,7 @@ def train_gaussian_splat(
         if n_after == n_before:
             visible = _visibility_from_meta(meta)
         else:
-            visible = torch.ones(n_after, device=device)
+            visible = torch.ones(n_after, dtype=torch.bool, device=device)
         for opt in optimizers.values():
             opt.step(visibility=visible)
 
@@ -459,16 +459,17 @@ def _apply_mask_params(
 
 
 def _visibility_from_meta(meta: dict) -> torch.Tensor:
-    """Extract per-Gaussian visibility (N,) float from rasterization meta.
+    """Extract per-Gaussian visibility (N,) bool from rasterization meta.
 
     gsplat radii shape is (..., C, N, 2) — the last dim holds x/y pixel radii.
     The standard gsplat idiom is (radii > 0).all(dim=-1) to reduce that dim first.
+    SelectiveAdam CUDA kernel requires a 1-D Bool tensor.
     """
     radii = meta["radii"]                    # (..., C, N, 2) unpacked or (nnz, 2) packed
     visible = (radii > 0).all(dim=-1)        # (..., C, N) — reduces x/y radii dim
     while visible.dim() > 1:
         visible = visible.any(dim=0)         # reduce batch/camera dims → (N,)
-    return visible.float()
+    return visible                           # bool (N,)
 
 
 def _export_ply(path: Path, params: dict) -> None:

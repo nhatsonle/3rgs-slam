@@ -579,7 +579,7 @@ class GaussianMapper:
             if n_after == n_before:
                 visible = _visibility_from_meta(meta)
             else:
-                visible = torch.ones(n_after, device=self.device)
+                visible = torch.ones(n_after, dtype=torch.bool, device=self.device)
             for opt in self.optimizers.values():
                 opt.step(visibility=visible)
 
@@ -613,7 +613,7 @@ class GaussianMapper:
                 keep = ~needle_mask
                 _apply_mask_params(self.data, self.optimizers, keep, self.strategy_state)
                 # rebuild visibility for new count
-                visible = torch.ones(self.data["means"].shape[0], device=self.device)
+                visible = torch.ones(self.data["means"].shape[0], dtype=torch.bool, device=self.device)
 
             # Global cap
             if self.data["means"].shape[0] > max_total:
