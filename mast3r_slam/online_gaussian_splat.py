@@ -46,20 +46,19 @@ from mast3r_slam.frame import Mode, SharedKeyframes
 from mast3r_slam.geometry import constrain_points_to_ray
 from mast3r_slam.lietorch_utils import as_SE3
 
-# Re-use helpers from the existing offline module to avoid duplication.
 from mast3r_slam.gaussian_splat import (
     SH_C0,
-    _apply_mask,
-    _clone,
+    _apply_mask_params,
+    _export_ply,
+    _make_splat_optimizers,
     _normal_to_quat_wxyz,
     _psnr,
-    _prune_mask,
-    _save_splat,
     _sim3_to_w2c,
     _ssim,
+    _visibility_from_meta,
 )
 
-PARAM_KEYS: List[str] = ["means", "sh_dc", "log_scales", "quats", "opacity"]
+PARAM_KEYS: List[str] = ["means", "sh_dc", "scales", "quats", "opacities"]
 
 
 # ── Tracking-Mapping Interface: keyframe snapshot ──────────────────────────────
@@ -133,13 +132,9 @@ class GaussianMapper:
 
         # Gaussian parameters (None until first keyframe)
         self.data: Dict[str, Optional[torch.Tensor]] = {k: None for k in PARAM_KEYS}
-        self.optimizer:         Optional[torch.optim.Adam] = None
-        self.absgrad_accum:     Optional[torch.Tensor]     = None
-
-        # Per-Gaussian visibility counter — counts how many renders included each Gaussian.
-        # Accumulated from rasterization radii (radii > 0 means visible).
-        # Never reset between density intervals; used to detect persistent floaters.
-        self.floater_vis_accum: Optional[torch.Tensor] = None
+        self.optimizers:    Optional[Dict[str, object]] = None
+        self.strategy:      Optional[object]            = None
+        self.strategy_state: Optional[dict]             = None
 
         self.n_kf:        int            = 0
         self.total_steps: int            = 0
@@ -147,16 +142,8 @@ class GaussianMapper:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _make_optimizer(self) -> torch.optim.Adam:
-        cfg = self.cfg
-        params = [
-            {"params": [self.data["means"]],      "lr": cfg.get("lr_means",   1.6e-4)},
-            {"params": [self.data["sh_dc"]],      "lr": cfg.get("lr_sh",      2.5e-3)},
-            {"params": [self.data["log_scales"]], "lr": cfg.get("lr_scales",  5e-3)},
-            {"params": [self.data["quats"]],      "lr": cfg.get("lr_quats",   1e-3)},
-            {"params": [self.data["opacity"]],    "lr": cfg.get("lr_opacity", 5e-2)},
-        ]
-        return torch.optim.Adam(params, eps=1e-15)
+    def _make_optimizers(self) -> dict:
+        return _make_splat_optimizers(self.data, self.cfg)
 
     def _get_K(self, cam_idx: int) -> torch.Tensor:
         """Return (1, 3, 3) intrinsic tensor on self.device for cam_idx."""
@@ -187,7 +174,7 @@ class GaussianMapper:
     def _extend_gaussians(self, new_gs: Dict[str, torch.Tensor]) -> None:
         """
         Append new Gaussian primitives to the existing state dict and
-        surgically extend the Adam optimiser state to match.
+        surgically extend per-param optimizer state to match.
         """
         n_new = new_gs["means"].shape[0]
         for key in PARAM_KEYS:
@@ -197,30 +184,26 @@ class GaussianMapper:
             ).detach().requires_grad_(True)
             self.data[key] = new_p
 
-            # Extend Adam state for this parameter
-            state = self.optimizer.state.pop(old_p, {})
+            if key not in self.optimizers:
+                continue
+            opt = self.optimizers[key]
+            old_state = opt.state.pop(old_p, {})
             new_state: dict = {}
-            if "exp_avg" in state:
-                pad = torch.zeros(n_new, *state["exp_avg"].shape[1:], device=self.device)
-                new_state["exp_avg"]    = torch.cat([state["exp_avg"],    pad])
-                new_state["exp_avg_sq"] = torch.cat([state["exp_avg_sq"], pad])
-                new_state["step"]       = state["step"]
-            self.optimizer.state[new_p] = new_state
-            for group in self.optimizer.param_groups:
-                if group["params"][0] is old_p:
-                    group["params"][0] = new_p
-                    break
+            if "exp_avg" in old_state:
+                pad = torch.zeros(n_new, *old_state["exp_avg"].shape[1:], device=self.device)
+                new_state["exp_avg"]    = torch.cat([old_state["exp_avg"],    pad])
+                new_state["exp_avg_sq"] = torch.cat([old_state["exp_avg_sq"], pad])
+                new_state["step"]       = old_state["step"]
+            opt.state[new_p] = new_state
+            opt.param_groups[0]["params"] = [new_p]
 
-        # Extend abs-grad accumulator
-        pad_acc = torch.zeros(n_new, device=self.device)
-        self.absgrad_accum = torch.cat([self.absgrad_accum, pad_acc])
-
-        # Extend visibility accumulator (new Gaussians start with zero visibility)
-        if self.floater_vis_accum is not None:
-            self.floater_vis_accum = torch.cat([
-                self.floater_vis_accum,
-                torch.zeros(n_new, device=self.device),
-            ])
+        # Extend strategy running state (grad2d, count) with zeros for new Gaussians
+        if self.strategy_state is not None:
+            for k in ("grad2d", "count"):
+                v = self.strategy_state.get(k)
+                if v is not None:
+                    pad = torch.zeros(n_new, *v.shape[1:], device=v.device)
+                    self.strategy_state[k] = torch.cat([v, pad])
 
     # ── Tracking-Mapping Interface: depth generation ──────────────────────────
 
@@ -337,11 +320,11 @@ class GaussianMapper:
         conf_map = conf_norm.reshape(H_img, W_img)
 
         new_gs = {
-            "means":      means_world[valid].detach(),
-            "sh_dc":      sh_dc[valid].detach(),
-            "log_scales": log_scales[valid].detach(),
-            "quats":      quats[valid].detach(),
-            "opacity":    opacity_logit[valid].detach(),
+            "means":     means_world[valid].detach(),
+            "sh_dc":     sh_dc[valid].detach(),
+            "scales":    log_scales[valid].detach(),
+            "quats":     quats[valid].detach(),
+            "opacities": opacity_logit[valid].detach(),
         }
         return new_gs, viewmat.cpu(), uimg.cpu(), depth_gt.cpu(), conf_map.cpu()
 
@@ -359,6 +342,8 @@ class GaussianMapper:
             threshold: Hard cap on newly inserted Gaussians for this keyframe.
                        Overrides config max_gaussians_per_kf when set.
         """
+        from gsplat import DefaultStrategy
+
         new_gs, viewmat, gt_img, depth_gt, conf_map = self._extract_from_snapshot(snap)
 
         # Per-keyframe Gaussian cap
@@ -368,7 +353,7 @@ class GaussianMapper:
         n = new_gs["means"].shape[0]
         if n > max_per_kf:
             keep = torch.topk(
-                torch.sigmoid(new_gs["opacity"]), max_per_kf
+                torch.sigmoid(new_gs["opacities"]), max_per_kf
             ).indices
             for k in PARAM_KEYS:
                 new_gs[k] = new_gs[k][keep]
@@ -387,38 +372,40 @@ class GaussianMapper:
         if self.img_shape is None:
             self.img_shape = snap["img_shape"]
 
+        cfg = self.cfg
         if self.data["means"] is None:
-            # Bootstrap: first keyframe initialises state and optimiser
+            # Bootstrap: first keyframe initialises state, strategy, and optimizers
             for k in PARAM_KEYS:
                 self.data[k] = new_gs[k].to(self.device).requires_grad_(True)
-            self.optimizer          = self._make_optimizer()
-            self.absgrad_accum      = torch.zeros(new_gs["means"].shape[0], device=self.device)
-            self.floater_vis_accum  = torch.zeros(new_gs["means"].shape[0], device=self.device)
+            self.optimizers = self._make_optimizers()
+
+            prune_thresh = cfg.get("prune_opacity_thresh", 0.005)
+            grad_thresh  = cfg.get("grad_thresh",          2e-4)
+            self.strategy = DefaultStrategy(
+                prune_opa         = prune_thresh,
+                grow_grad2d       = grad_thresh,
+                refine_start_iter = cfg.get("densify_from_iter",      500),
+                refine_stop_iter  = cfg.get("densify_until_iter",    5_000),
+                refine_every      = cfg.get("densify_interval",         100),
+                reset_every       = cfg.get("opacity_reset_interval", 3_000),
+                absgrad           = True,
+                verbose           = False,
+            )
+            self.strategy.check_sanity(self.data, self.optimizers)
+            self.strategy_state = self.strategy.initialize_state()
         else:
             self._extend_gaussians(new_gs)
 
         # Global hard cap on total Gaussian count
-        max_total = self.cfg.get("max_gaussians", 2_000_000)
+        max_total = cfg.get("max_gaussians", 2_000_000)
         n_total   = self.data["means"].shape[0]
         if n_total > max_total:
             keep = torch.topk(
-                torch.sigmoid(self.data["opacity"].detach()), max_total
+                torch.sigmoid(self.data["opacities"].detach()), max_total
             ).indices
             bool_keep = torch.zeros(n_total, dtype=torch.bool, device=self.device)
             bool_keep[keep] = True
-            _apply_mask(self.data, self.optimizer, bool_keep)
-            self.absgrad_accum = self.absgrad_accum[bool_keep]
-            if self.floater_vis_accum is not None:
-                self.floater_vis_accum = self.floater_vis_accum[bool_keep]
-
-        # Register per-camera appearance parameters (if enabled)
-        if self.cfg.get("appearance_compensation", False):
-            ac = torch.ones(3,  device=self.device, requires_grad=True)
-            bc = torch.zeros(3, device=self.device, requires_grad=True)
-            self.app_scale.append(ac)
-            self.app_bias.append(bc)
-            # Rebuild optimizer so new params are included
-            self._rebuild_app_optimizer()
+            _apply_mask_params(self.data, self.optimizers, bool_keep, self.strategy_state)
 
         self.n_kf += 1
 
@@ -467,12 +454,8 @@ class GaussianMapper:
         max_scale_ratio = cfg.get("max_scale_ratio",      10.0)
 
         # Density control parameters
-        densify_from  = cfg.get("densify_from_iter",      500)
-        densify_until = cfg.get("densify_until_iter",     5_000)
-        densify_int   = cfg.get("densify_interval",       100)
         opacity_rst   = cfg.get("opacity_reset_interval", 3_000)
         prune_thresh  = cfg.get("prune_opacity_thresh",   0.005)
-        grad_thresh   = cfg.get("grad_thresh",            2e-4)
         max_total     = threshold if threshold is not None else cfg.get("max_gaussians", 2_000_000)
 
         H, W = self.img_shape
@@ -498,6 +481,9 @@ class GaussianMapper:
             gt      = self.gt_images[cam_idx].to(self.device)              # (H, W, 3)
             K_i     = self._get_K(cam_idx)                                 # (1, 3, 3)
 
+            for opt in self.optimizers.values():
+                opt.zero_grad(set_to_none=True)
+
             # SH degree: use sh_rest if available (added at fine-stage start)
             sh_rest = self.data.get("sh_rest")
             if sh_rest is not None:
@@ -510,8 +496,8 @@ class GaussianMapper:
             render_colors, _, meta = rasterization(
                 means       = self.data["means"],
                 quats       = self.data["quats"],
-                scales      = torch.exp(self.data["log_scales"]),
-                opacities   = torch.sigmoid(self.data["opacity"]),
+                scales      = torch.exp(self.data["scales"]),
+                opacities   = torch.sigmoid(self.data["opacities"]),
                 colors      = sh_colors,
                 viewmats    = viewmat,
                 Ks          = K_i,
@@ -528,12 +514,8 @@ class GaussianMapper:
             if render.grad_fn is None:
                 continue
 
-            # Per-camera appearance compensation: render_out = ac * render + bc
-            # Handles exposure/WB drift across keyframes; ac/bc are training-only.
-            if cfg.get("appearance_compensation", False) and cam_idx < len(self.app_scale):
-                ac = self.app_scale[cam_idx]   # (3,) broadcast over H,W
-                bc = self.app_bias[cam_idx]    # (3,)
-                render = (render * ac + bc).clamp(0.0, 1.0)
+            # Required by DefaultStrategy._update_state
+            meta["n_cameras"] = 1
 
             # L_rgb: L1 + optional D-SSIM (paper Eq.10 is pure L1; SSIM improves
             # perceptual quality when lambda_ssim > 0 in config)
@@ -557,7 +539,7 @@ class GaussianMapper:
                     ).mean()
 
             # L_iso: isotropic scale regularisation (paper Eq.12)
-            scales  = torch.exp(self.data["log_scales"])                   # (N, 3)
+            scales  = torch.exp(self.data["scales"])                       # (N, 3)
             s_bar   = scales.mean(dim=-1, keepdim=True)
             l_iso   = ((scales - s_bar) ** 2).sum(dim=-1).mean()
 
@@ -571,112 +553,76 @@ class GaussianMapper:
             acc["l_iso"]   += l_iso.item()
             acc["n_steps"] += 1
 
-            self.optimizer.zero_grad(set_to_none=True)
-            if self.app_optimizer is not None:
-                self.app_optimizer.zero_grad(set_to_none=True)
+            self.strategy.step_pre_backward(
+                self.data, self.optimizers, self.strategy_state, self.total_steps, meta
+            )
             loss.backward()
-
-            # Accumulate abs-2D gradient for densification
-            if "means2d" in meta and meta["means2d"].absgrad is not None:
-                self.absgrad_accum += (
-                    meta["means2d"].absgrad.squeeze(0).norm(dim=-1).detach()
-                )
-
-            # Accumulate per-Gaussian visibility (radii > 0 ↔ Gaussian projected to screen)
-            # meta["radii"] shape varies by gsplat version: (C,N), (C,N,2), or (N,).
-            # Collapse all dims after the first (Gaussian) dim before comparing.
-            if self.floater_vis_accum is not None and "radii" in meta and meta["radii"] is not None:
-                radii = meta["radii"].squeeze(0).detach()          # (N,) or (N, 2)
-                vis   = (radii.reshape(radii.shape[0], -1).abs().sum(dim=-1) > 0).float()  # (N,)
-                if vis.shape[0] == self.floater_vis_accum.shape[0]:
-                    self.floater_vis_accum += vis
 
             torch.nn.utils.clip_grad_norm_(
                 [
                     self.data["means"],
-                    self.data["log_scales"],
+                    self.data["scales"],
                     self.data["quats"],
-                    self.data["opacity"],
+                    self.data["opacities"],
                 ],
                 max_norm=1.0,
             )
-            self.optimizer.step()
-            if self.app_optimizer is not None:
-                self.app_optimizer.step()
+
+            n_before = self.data["means"].shape[0]
+            self.strategy.step_post_backward(
+                self.data, self.optimizers, self.strategy_state,
+                self.total_steps, meta, packed=False,
+            )
+            n_after = self.data["means"].shape[0]
+
+            # Visibility-aware optimizer step
+            if n_after == n_before:
+                visible = _visibility_from_meta(meta)
+            else:
+                visible = torch.ones(n_after, device=self.device)
+            for opt in self.optimizers.values():
+                opt.step(visibility=visible)
 
             with torch.no_grad():
                 self.data["quats"].data = F.normalize(self.data["quats"].data, dim=-1)
-                # Keep appearance params in a sane range to prevent color inversion
-                if cfg.get("appearance_compensation", False) and cam_idx < len(self.app_scale):
-                    self.app_scale[cam_idx].data.clamp_(0.2, 5.0)
-                    self.app_bias[cam_idx].data.clamp_(-0.5, 0.5)
-                ls = self.data["log_scales"].data
-                # Floor all axes to prevent degenerate near-zero Gaussians.
+                ls = self.data["scales"].data
                 ls.clamp_(min=min_log_scale)
-                # Shift ALL axes down when the largest axis exceeds max_log_scale.
-                # This caps the maximum while PRESERVING disc shape:
-                #   disc [2.0, 2.0, -4.0] with max_log=-2.5 → shift -4.5 → [-2.5,-2.5,-8.5→floor]
                 max_s    = ls.max(dim=-1, keepdim=True).values            # (N,1)
                 overflow = (max_s - max_log_scale).clamp(min=0.0)         # (N,1) ≥0
-                ls      -= overflow                                        # shift all axes
-                ls.clamp_(min=min_log_scale)                               # re-apply floor
+                ls      -= overflow
+                ls.clamp_(min=min_log_scale)
 
             self.total_steps += 1
             s = self.total_steps
 
-            # Opacity reset
+            # Manual opacity reset (DefaultStrategy built-in is broken)
             if s > 0 and s % opacity_rst == 0:
                 with torch.no_grad():
-                    self.data["opacity"].data.fill_(-2.0)
-                self.absgrad_accum.zero_()
+                    self.data["opacities"].data.fill_(-2.0)
+                if self.strategy_state.get("grad2d") is not None:
+                    self.strategy_state["grad2d"].zero_()
+                    self.strategy_state["count"].zero_()
 
-            # Adaptive density control
-            if densify_from <= s < densify_until and s % densify_int == 0:
-                prune_mask = _prune_mask(self.data, threshold=prune_thresh)
-                # Prune true needles: one axis >> second-largest axis.
-                # Use s1/s2 (max/median), NOT s1/s3 (max/min), so flat disc
-                # Gaussians [sx, sy, sz≈0] with s1/s2≈1 are NOT wrongly pruned.
-                with torch.no_grad():
-                    scales = torch.exp(self.data["log_scales"].detach())           # (N, 3)
-                    sorted_s = scales.sort(dim=-1, descending=True).values         # s1>=s2>=s3
-                    needle_ratio = sorted_s[:, 0] / sorted_s[:, 1].clamp(min=1e-6)
-                    prune_mask = prune_mask | (needle_ratio > max_scale_ratio)
+            # Needle pruning (DefaultStrategy doesn't handle anisotropy ratio)
+            with torch.no_grad():
+                cur_scales = torch.exp(self.data["scales"].detach())       # (N, 3)
+                sorted_s = cur_scales.sort(dim=-1, descending=True).values
+                needle_ratio = sorted_s[:, 0] / sorted_s[:, 1].clamp(min=1e-6)
+                needle_mask = needle_ratio > max_scale_ratio
+            if needle_mask.any():
+                keep = ~needle_mask
+                _apply_mask_params(self.data, self.optimizers, keep, self.strategy_state)
+                # rebuild visibility for new count
+                visible = torch.ones(self.data["means"].shape[0], device=self.device)
 
-                # Visibility-based floater pruning: Gaussians that are never projected
-                # onto any camera plane accumulate zero visibility → persistent floaters.
-                # Only active after enough renders to give real Gaussians a chance to appear.
-                min_vis_rate = cfg.get("min_vis_rate", 0.0)
-                if (min_vis_rate > 0 and self.floater_vis_accum is not None
-                        and s > densify_from + densify_int * 3
-                        and self.floater_vis_accum.shape[0] == prune_mask.shape[0]):
-                    vis_per_step = self.floater_vis_accum / max(s, 1)
-                    floater_mask = vis_per_step < min_vis_rate
-                    prune_mask   = prune_mask | floater_mask
-
-                if prune_mask.any():
-                    _apply_mask(self.data, self.optimizer, ~prune_mask)
-                    self.absgrad_accum = self.absgrad_accum[~prune_mask]
-                    if self.floater_vis_accum is not None:
-                        self.floater_vis_accum = self.floater_vis_accum[~prune_mask]
-
-                if self.absgrad_accum.shape[0] == self.data["means"].shape[0]:
-                    clone_mask = (self.absgrad_accum / max(s, 1)) > grad_thresh
-                    if clone_mask.any():
-                        _clone(
-                            self.data, self.optimizer,
-                            clone_mask, max_total, threshold=max_total,
-                        )
-                        extra = clone_mask.sum().item()
-                        self.absgrad_accum = torch.cat([
-                            self.absgrad_accum,
-                            torch.zeros(extra, device=self.device),
-                        ])
-                        if self.floater_vis_accum is not None:
-                            self.floater_vis_accum = torch.cat([
-                                self.floater_vis_accum,
-                                torch.zeros(extra, device=self.device),
-                            ])
-                self.absgrad_accum.zero_()
+            # Global cap
+            if self.data["means"].shape[0] > max_total:
+                keep_idx = torch.topk(
+                    torch.sigmoid(self.data["opacities"].detach()), max_total
+                ).indices
+                bool_keep = torch.zeros(self.data["means"].shape[0], dtype=torch.bool, device=self.device)
+                bool_keep[keep_idx] = True
+                _apply_mask_params(self.data, self.optimizers, bool_keep, self.strategy_state)
 
         return acc
 
@@ -734,28 +680,19 @@ class GaussianMapper:
 
         # ── 1. Initial prune: remove low-opacity floaters before fine stage ──
         fine_prune_thresh = cfg.get("fine_prune_thresh", 0.01)
-        prune_mask = _prune_mask(self.data, threshold=fine_prune_thresh)
+        with torch.no_grad():
+            prune_mask = torch.sigmoid(self.data["opacities"].detach()) < fine_prune_thresh
         if prune_mask.any():
-            _apply_mask(self.data, self.optimizer, ~prune_mask)
-            # absgrad_accum will be reset below; shrink it first so shapes match
-            self.absgrad_accum = self.absgrad_accum[~prune_mask]
-            if self.floater_vis_accum is not None:
-                self.floater_vis_accum = self.floater_vis_accum[~prune_mask]
+            _apply_mask_params(self.data, self.optimizers, ~prune_mask, self.strategy_state)
             print(
                 f"[OnlineGS] Initial prune removed {prune_mask.sum().item():,} floaters → "
                 f"{self.data['means'].shape[0]:,} remaining"
             )
 
         # ── 2. Reset step counter → density control window covers fine iters ─
-        # Coarse mapping leaves total_steps >> densify_until_iter, so densification
-        # would never trigger without this reset.
         self.total_steps = 0
-        self.absgrad_accum     = torch.zeros(self.data["means"].shape[0], device=self.device)
-        self.floater_vis_accum = torch.zeros(self.data["means"].shape[0], device=self.device)
 
         # ── 3. Promote to higher SH degree for view-dependent color ──────────
-        # SH degree 0 = constant color → PSNR ceiling ~20 dB.
-        # Adding SH degree 1-3 allows view-dependent effects (specular, etc.).
         fine_sh_degree = cfg.get("fine_sh_degree", 3)
         if fine_sh_degree > 0 and self.data.get("sh_rest") is None:
             n_gs    = self.data["means"].shape[0]
@@ -763,15 +700,17 @@ class GaussianMapper:
             sh_rest = torch.zeros(n_gs, n_rest, 3, device=self.device, requires_grad=True)
             self.data["sh_rest"] = sh_rest
             lr_sh_rest = cfg.get("lr_sh_rest", cfg.get("lr_sh", 2.5e-3) / 20.0)
-            self.optimizer.add_param_group({"params": [sh_rest], "lr": lr_sh_rest})
+            # Add sh_rest to per-param optimizers dict
+            from gsplat import SelectiveAdam
+            self.optimizers["sh_rest"] = SelectiveAdam(
+                [{"params": [sh_rest], "lr": lr_sh_rest}],
+                eps=1e-15,
+                betas=(0.9, 0.999),
+            )
             print(f"[OnlineGS] Promoted to SH degree {fine_sh_degree} "
                   f"(+{n_rest}×3 coeffs per Gaussian, lr={lr_sh_rest:.2e})")
 
         # ── 4. Disable opacity resets and depth loss for fine stage ──────────
-        # Opacity resets destroy well-optimised values.
-        # Depth loss during fine stage hurts PSNR: cross-camera depth GTs are
-        # inconsistent (different Sim3 scale per keyframe), so depth supervision
-        # in the multi-camera fine stage adds noise rather than signal.
         saved_opacity_reset = cfg.get("opacity_reset_interval", 3000)
         cfg["opacity_reset_interval"] = n_iters * 100  # effectively ∞
         saved_lambda_depth  = cfg.get("lambda_depth", 0.1)
@@ -811,8 +750,8 @@ class GaussianMapper:
                             out, _, _ = rasterization(
                                 means     = self.data["means"],
                                 quats     = self.data["quats"],
-                                scales    = torch.exp(self.data["log_scales"]),
-                                opacities = torch.sigmoid(self.data["opacity"]),
+                                scales    = torch.exp(self.data["scales"]),
+                                opacities = torch.sigmoid(self.data["opacities"]),
                                 colors    = _sh_col,
                                 viewmats  = viewmat,
                                 Ks        = K_i,
@@ -836,7 +775,7 @@ class GaussianMapper:
     def save(self, save_dir: Path, seq_name: str) -> None:
         """Save current Gaussian map as a standard 3DGS PLY file."""
         out_path = Path(save_dir) / f"{seq_name}_online_gs.ply"
-        _save_splat(out_path, self.data)
+        _export_ply(out_path, self.data)
 
 
 # ── Worker process entry point ────────────────────────────────────────────────
