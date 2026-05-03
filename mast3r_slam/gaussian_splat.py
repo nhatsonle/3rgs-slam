@@ -45,12 +45,12 @@ def extract_gaussians(
                     Prevents Gaussians boom on large / long sequences.
 
     Returns:
-        Dict with keys: means, sh_dc, log_scales, quats (wxyz), opacity_logit,
+        Dict with keys: means, sh_dc, scales (log), quats (wxyz), opacities (logit),
         viewmats (world→cam, (N_kf,4,4)), gt_images (list of (H,W,3) tensors),
         Ks (optional (N_kf,3,3) tensor).
     """
-    all_means, all_sh_dc, all_log_scales = [], [], []
-    all_quats, all_opacity = [], []
+    all_means, all_sh_dc, all_scales = [], [], []
+    all_quats, all_opacities = [], []
     all_viewmats, all_gt_images, all_Ks = [], [], []
     all_depth_maps, all_conf_maps = [], []
 
@@ -113,9 +113,9 @@ def extract_gaussians(
 
         all_means.append(means_world[valid])
         all_sh_dc.append(sh_dc[valid])
-        all_log_scales.append(log_scales[valid])
+        all_scales.append(log_scales[valid])
         all_quats.append(quats[valid])
-        all_opacity.append(opacity_logit[valid])
+        all_opacities.append(opacity_logit[valid])
         all_viewmats.append(viewmat.to(device))
         all_gt_images.append(kf.uimg.to(device))                # (H, W, 3)
         all_depth_maps.append(depth_gt.to(device))              # (H, W)
@@ -129,9 +129,9 @@ def extract_gaussians(
     result = {
         "means":      torch.cat(all_means,      dim=0).requires_grad_(True),
         "sh_dc":      torch.cat(all_sh_dc,      dim=0).requires_grad_(True),
-        "log_scales": torch.cat(all_log_scales, dim=0).requires_grad_(True),
+        "scales":     torch.cat(all_scales,     dim=0).requires_grad_(True),
         "quats":      torch.cat(all_quats,      dim=0).requires_grad_(True),
-        "opacity":    torch.cat(all_opacity,    dim=0).requires_grad_(True),
+        "opacities":  torch.cat(all_opacities,  dim=0).requires_grad_(True),
         "viewmats":   torch.stack(all_viewmats),                # (N_kf, 4, 4)
         "gt_images":  all_gt_images,
         "depth_maps": all_depth_maps,                           # list[(H, W)]
@@ -166,7 +166,7 @@ def train_gaussian_splat(
                     cfg['max_gaussians'] when set.  Guards against memory OOM
                     on very long sequences.  None means use cfg['max_gaussians'].
     """
-    from gsplat import rasterization
+    from gsplat import rasterization, DefaultStrategy
 
     conf_thresh = cfg.get("c_conf_threshold", 0.5)
     max_gaussians = threshold if threshold is not None else cfg.get("max_gaussians", 2_000_000)
@@ -178,7 +178,7 @@ def train_gaussian_splat(
     if n_init > max_gaussians:
         print(f"[GS] Capping {n_init:,} → {max_gaussians:,} Gaussians (threshold={max_gaussians})")
         keep_idx = torch.topk(
-            torch.sigmoid(data["opacity"].detach()), max_gaussians
+            torch.sigmoid(data["opacities"].detach()), max_gaussians
         ).indices
         data = _index_data(data, keep_idx)
 
@@ -202,15 +202,8 @@ def train_gaussian_splat(
         )
         Ks_render = K_fb.unsqueeze(0).expand(n_kf, -1, -1).contiguous()
 
-    # ── Optimiser (per-parameter learning rates from config)
-    params = [
-        {"params": [data["means"]],      "lr": cfg.get("lr_means",   1.6e-4)},
-        {"params": [data["sh_dc"]],      "lr": cfg.get("lr_sh",      2.5e-3)},
-        {"params": [data["log_scales"]], "lr": cfg.get("lr_scales",  5e-3)},
-        {"params": [data["quats"]],      "lr": cfg.get("lr_quats",   1e-3)},
-        {"params": [data["opacity"]],    "lr": cfg.get("lr_opacity", 5e-2)},
-    ]
-    optimizer = torch.optim.Adam(params, eps=1e-15)
+    # ── Per-parameter SelectiveAdam optimisers
+    optimizers = _make_splat_optimizers(data, cfg)
 
     n_iters            = cfg.get("n_iters",                10_000)
     densify_from       = cfg.get("densify_from_iter",         500)
@@ -223,10 +216,22 @@ def train_gaussian_splat(
     lambda_depth       = cfg.get("lambda_depth",              0.1)
     depth_min_conf     = cfg.get("depth_min_conf",            0.3)
 
+    # ── DefaultStrategy for adaptive density control
+    strategy = DefaultStrategy(
+        prune_opa         = prune_thresh,
+        grow_grad2d       = grad_thresh,
+        refine_start_iter = densify_from,
+        refine_stop_iter  = densify_until,
+        refine_every      = densify_interval,
+        reset_every       = opacity_reset_int,
+        absgrad           = True,
+        verbose           = False,
+    )
+    strategy.check_sanity(data, optimizers)
+    strategy_state = strategy.initialize_state()
+
     print(f"[GS] Training {data['means'].shape[0]:,} Gaussians for {n_iters} iters ...")
     print(f"[GS] Image size: {H_img}×{W_img}  |  Keyframes: {n_kf}")
-
-    absgrad_accum = torch.zeros(data["means"].shape[0], device=device)
 
     # main.py disables grad globally for SLAM; re-enable for GS optimisation
     torch.set_grad_enabled(True)
@@ -238,14 +243,15 @@ def train_gaussian_splat(
         gt      = data["gt_images"][kf_idx]                     # (H, W, 3)
         K_i     = Ks_render[kf_idx].unsqueeze(0)               # (1, 3, 3)
 
+        for opt in optimizers.values():
+            opt.zero_grad(set_to_none=True)
+
         # ── Rasterise RGB + camera-z depth in one pass
-        # render_mode="RGB+D": output shape (1, H, W, 4); last channel = depth (m)
-        # packed=False: ensures grad_fn even when few Gaussians project onto image.
         render_colors, render_alphas, meta = rasterization(
             means       = data["means"],
             quats       = data["quats"],                        # wxyz
-            scales      = torch.exp(data["log_scales"]),
-            opacities   = torch.sigmoid(data["opacity"]),       # (N,)
+            scales      = torch.exp(data["scales"]),
+            opacities   = torch.sigmoid(data["opacities"]),     # (N,)
             colors      = data["sh_dc"].unsqueeze(1),           # (N, 1, 3) DC SH
             viewmats    = viewmat,
             Ks          = K_i,
@@ -263,6 +269,9 @@ def train_gaussian_splat(
         if render.grad_fn is None:
             continue
 
+        # Required by DefaultStrategy._update_state
+        meta["n_cameras"] = 1
+
         # ── Combined loss: (1-λ)*L1 + λ*D-SSIM + λ_depth*L_depth
         l_l1     = (render - gt).abs().mean()
         l_d_ssim = (1.0 - _ssim(render, gt)) / 2.0
@@ -278,48 +287,48 @@ def train_gaussian_splat(
                 ).abs()).mean()
                 loss = loss + lambda_depth * l_depth
 
-        optimizer.zero_grad(set_to_none=True)
+        strategy.step_pre_backward(data, optimizers, strategy_state, it, meta)
         loss.backward()
-
-        # Accumulate abs 2D gradient for densification
-        if "means2d" in meta and meta["means2d"].absgrad is not None:
-            absgrad_accum += meta["means2d"].absgrad.squeeze(0).norm(dim=-1).detach()
 
         # Gradient clipping: prevents single large step exploding means
         torch.nn.utils.clip_grad_norm_(
-            [data["means"], data["log_scales"], data["quats"], data["opacity"]],
+            [data["means"], data["scales"], data["quats"], data["opacities"]],
             max_norm=1.0,
         )
-        optimizer.step()
+
+        n_before = data["means"].shape[0]
+        strategy.step_post_backward(data, optimizers, strategy_state, it, meta, packed=False)
+        n_after = data["means"].shape[0]
+
+        # Visibility-aware optimizer step; extend to new size if densification changed count
+        if n_after == n_before:
+            visible = _visibility_from_meta(meta)
+        else:
+            visible = torch.ones(n_after, device=device)
+        for opt in optimizers.values():
+            opt.step(visibility=visible)
 
         # ── Keep quats normalised
         with torch.no_grad():
             data["quats"].data = F.normalize(data["quats"].data, dim=-1)
 
-        # ── Opacity reset: flatten all to ~0.12 periodically so dead Gaussians surface
+        # ── Manual opacity reset (DefaultStrategy's built-in is broken due to operator precedence)
         if it > 0 and it % opacity_reset_int == 0:
             with torch.no_grad():
-                data["opacity"].data.fill_(-2.0)               # sigmoid(-2) ≈ 0.12
-            absgrad_accum.zero_()
+                data["opacities"].data.fill_(-2.0)               # sigmoid(-2) ≈ 0.12
+            if strategy_state.get("grad2d") is not None:
+                strategy_state["grad2d"].zero_()
+                strategy_state["count"].zero_()
 
-        # ── Adaptive density control
-        if densify_from <= it < densify_until and it % densify_interval == 0:
-            # Prune low-opacity first (reduces count before potential split)
-            prune_mask = _prune_mask(data, threshold=prune_thresh)
-            if prune_mask.any():
-                _apply_mask(data, optimizer, ~prune_mask)
-                absgrad_accum = absgrad_accum[~prune_mask]
-
-            # Clone Gaussians with high 2D gradient (under-reconstructed regions)
-            if absgrad_accum.shape[0] == data["means"].shape[0]:
-                clone_mask = (absgrad_accum / max(it, 1)) > grad_thresh
-                if clone_mask.any():
-                    _clone(data, optimizer, clone_mask, max_gaussians, threshold=max_gaussians)
-                    extra = clone_mask.sum().item()
-                    absgrad_accum = torch.cat([
-                        absgrad_accum, torch.zeros(extra, device=device)
-                    ])
-            absgrad_accum.zero_()
+        # ── Global Gaussian count cap
+        if data["means"].shape[0] > max_gaussians:
+            with torch.no_grad():
+                keep_idx = torch.topk(
+                    torch.sigmoid(data["opacities"].detach()), max_gaussians
+                ).indices
+                bool_keep = torch.zeros(data["means"].shape[0], dtype=torch.bool, device=device)
+                bool_keep[keep_idx] = True
+            _apply_mask_params(data, optimizers, bool_keep, strategy_state)
 
         if it % 500 == 0:
             with torch.no_grad():
@@ -332,7 +341,7 @@ def train_gaussian_splat(
             )
 
     out_path = save_dir / f"{seq_name}_gs.ply"
-    _save_splat(out_path, data)
+    _export_ply(out_path, data)
     print(f"[GS] Saved → {out_path}")
 
 
@@ -379,87 +388,102 @@ def _ssim(render: torch.Tensor, gt: torch.Tensor, window_size: int = 11) -> floa
     return (num / den.clamp(min=1e-10)).mean()
 
 
-def _prune_mask(data: dict, threshold: float = 0.005) -> torch.Tensor:
-    """Return bool mask of Gaussians to prune (True = prune).
-
-    Args:
-        threshold: Opacity below which a Gaussian is considered dead.
-                   Lower values keep more Gaussians; raise to prune harder.
-    """
-    return torch.sigmoid(data["opacity"]).detach() < threshold
-
-
 def _gs_param_keys(data: dict) -> list:
     """Return ordered list of per-Gaussian parameter keys present in data.
 
     Always starts with the fixed base keys; appends optional keys (e.g. sh_rest
     added at fine-refinement stage) if they exist in data.
     """
-    base = ["means", "sh_dc", "log_scales", "quats", "opacity"]
+    base = ["means", "sh_dc", "scales", "quats", "opacities"]
     extra = [k for k in ("sh_rest",) if k in data and data[k] is not None]
     return base + extra
 
 
-def _clone(data: dict, optimizer, mask: torch.Tensor, current_max: int, threshold: int) -> None:
-    """Clone Gaussians indicated by mask; respects hard cap `threshold`."""
-    n_existing = data["means"].shape[0]
-    n_clone = mask.sum().item()
-    allowed = max(0, threshold - n_existing)
-    if allowed == 0:
-        return
-    n_clone = min(n_clone, allowed)
-    clone_idx = mask.nonzero(as_tuple=True)[0][:n_clone]
-
-    with torch.no_grad():
-        for key in _gs_param_keys(data):
-            cloned = data[key][clone_idx].detach().clone().requires_grad_(True)
-            if key == "means":
-                jitter = torch.randn_like(cloned) * 0.001
-                cloned = (cloned + jitter).detach().requires_grad_(True)
-            new_tensor = torch.cat([data[key], cloned], dim=0).requires_grad_(True)
-            old_p = data[key]
-            data[key] = new_tensor
-            state = optimizer.state.pop(old_p, {})
-            new_state = {}
-            if "exp_avg" in state:
-                pad = torch.zeros(n_clone, *state["exp_avg"].shape[1:],
-                                  device=state["exp_avg"].device)
-                new_state["exp_avg"]    = torch.cat([state["exp_avg"],    pad], dim=0)
-                new_state["exp_avg_sq"] = torch.cat([state["exp_avg_sq"], pad], dim=0)
-                new_state["step"] = state["step"]
-            optimizer.state[new_tensor] = new_state
-            for group in optimizer.param_groups:
-                if group["params"][0] is old_p:
-                    group["params"][0] = new_tensor
-                    break
-
-
-def _apply_mask(data: dict, optimizer, keep: torch.Tensor) -> None:
-    """Compact all per-Gaussian tensors and Adam state to `keep` indices."""
-    for key in _gs_param_keys(data):
-        old_p = data[key]
-        new_p = old_p[keep].detach().requires_grad_(True)
-        data[key] = new_p
-        state = optimizer.state.pop(old_p, {})
-        new_state = {}
-        if "exp_avg" in state:
-            new_state["exp_avg"]    = state["exp_avg"][keep]
-            new_state["exp_avg_sq"] = state["exp_avg_sq"][keep]
-            new_state["step"]       = state["step"]
-        optimizer.state[new_p] = new_state
-        for group in optimizer.param_groups:
-            if group["params"][0] is old_p:
-                group["params"][0] = new_p
-                break
-
-
 def _index_data(data: dict, idx: torch.Tensor) -> dict:
     """Return a new data dict with only the Gaussians at `idx`."""
-    param_keys = ["means", "sh_dc", "log_scales", "quats", "opacity"]
+    param_keys = ["means", "sh_dc", "scales", "quats", "opacities"]
     out = dict(data)
     for key in param_keys:
         out[key] = data[key][idx].detach().requires_grad_(True)
     return out
+
+
+def _make_splat_optimizers(params: dict, cfg: dict) -> dict:
+    """Create one SelectiveAdam per Gaussian parameter."""
+    from gsplat import SelectiveAdam
+    lrs = {
+        "means":     cfg.get("lr_means",   1.6e-4),
+        "sh_dc":     cfg.get("lr_sh",      2.5e-3),
+        "scales":    cfg.get("lr_scales",  5e-3),
+        "quats":     cfg.get("lr_quats",   1e-3),
+        "opacities": cfg.get("lr_opacity", 5e-2),
+    }
+    return {
+        key: SelectiveAdam(
+            [{"params": [params[key]], "lr": lr}],
+            eps=1e-15,
+            betas=(0.9, 0.999),
+        )
+        for key, lr in lrs.items()
+    }
+
+
+def _apply_mask_params(
+    params: dict,
+    optimizers: dict,
+    keep: torch.Tensor,
+    strategy_state: dict = None,
+) -> None:
+    """Compact all per-Gaussian tensors and per-param optimizer state to `keep` indices."""
+    for key in _gs_param_keys(params):
+        old_p = params[key]
+        new_p = old_p[keep].detach().requires_grad_(True)
+        params[key] = new_p
+        if key not in optimizers:
+            continue
+        opt = optimizers[key]
+        old_state = opt.state.pop(old_p, {})
+        new_state = {}
+        if "exp_avg" in old_state:
+            new_state = {
+                "exp_avg":    old_state["exp_avg"][keep],
+                "exp_avg_sq": old_state["exp_avg_sq"][keep],
+                "step":       old_state["step"],
+            }
+        opt.state[new_p] = new_state
+        opt.param_groups[0]["params"] = [new_p]
+    if strategy_state is not None:
+        for k in ("grad2d", "count"):
+            if strategy_state.get(k) is not None:
+                strategy_state[k] = strategy_state[k][keep]
+
+
+def _visibility_from_meta(meta: dict) -> torch.Tensor:
+    """Extract per-Gaussian visibility (N,) float from rasterization meta."""
+    radii = meta["radii"]                    # (C, N) or (N,)
+    visible = (radii > 0).any(dim=0) if radii.dim() > 1 else (radii > 0)
+    return visible.float()
+
+
+def _export_ply(path: Path, params: dict) -> None:
+    """Save Gaussians to PLY using gsplat.export_splats (fixes f_rest channel ordering)."""
+    from gsplat import export_splats
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    N = params["means"].shape[0]
+    sh_rest = params.get("sh_rest")
+    shN = sh_rest.detach().cpu() if sh_rest is not None else torch.zeros(N, 0, 3)
+    export_splats(
+        means     = params["means"].detach().cpu(),
+        scales    = torch.exp(params["scales"]).detach().cpu(),       # actual, not log
+        quats     = params["quats"].detach().cpu(),
+        opacities = torch.sigmoid(params["opacities"]).detach().cpu(),  # actual, not logit
+        sh0       = params["sh_dc"].detach().cpu().unsqueeze(1),      # (N, 1, 3)
+        shN       = shN,                                               # (N, K, 3)
+        format    = "ply",
+        save_to   = str(path),
+    )
+    print(f"[GS] PLY written: {path}  ({N:,} Gaussians)")
 
 
 def _normal_to_quat_wxyz(normals: torch.Tensor) -> torch.Tensor:
@@ -528,53 +552,3 @@ def _quat_xyzw_to_matrix(q: torch.Tensor) -> torch.Tensor:
             2*(x*y + w*z), 1 - 2*(x*x + z*z),     2*(y*z - w*x),
             2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x*x + y*y),
     ], dim=-1).reshape(3, 3)
-
-
-def _save_splat(path: Path, data: dict) -> None:
-    """Save Gaussians as a standard 3DGS PLY (compatible with SuperSplat viewer).
-
-    3DGS PLY convention: rot fields are wxyz.  SH rest coefficients are saved
-    as f_rest_* fields when present (degree 1-3 view-dependent color).
-    """
-    from plyfile import PlyData, PlyElement
-
-    means      = data["means"].detach().cpu().float().numpy()
-    sh_dc      = data["sh_dc"].detach().cpu().float().numpy()
-    log_scales = data["log_scales"].detach().cpu().float().numpy()
-    quats      = data["quats"].detach().cpu().float().numpy()   # wxyz
-    opacity    = data["opacity"].detach().cpu().float().numpy() # logit
-
-    N = means.shape[0]
-    dtype = [
-        ("x",     "f4"), ("y",     "f4"), ("z",     "f4"),
-        ("f_dc_0","f4"), ("f_dc_1","f4"), ("f_dc_2","f4"),
-        ("opacity","f4"),
-        ("scale_0","f4"), ("scale_1","f4"), ("scale_2","f4"),
-        ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3","f4"),
-    ]
-
-    # Include SH rest coefficients if available (standard 3DGS PLY format)
-    sh_rest_np = None
-    if data.get("sh_rest") is not None:
-        sh_rest_np = data["sh_rest"].detach().cpu().float().numpy()  # (N, n_rest, 3)
-        n_rest = sh_rest_np.shape[1]
-        for i in range(n_rest):
-            for c in range(3):
-                dtype.append((f"f_rest_{i * 3 + c}", "f4"))
-
-    arr = np.empty(N, dtype=dtype)
-    arr["x"],       arr["y"],       arr["z"]       = means.T
-    arr["f_dc_0"],  arr["f_dc_1"],  arr["f_dc_2"]  = sh_dc.T
-    arr["opacity"]                                 = opacity
-    arr["scale_0"], arr["scale_1"], arr["scale_2"] = log_scales.T
-    arr["rot_0"], arr["rot_1"], arr["rot_2"], arr["rot_3"] = quats.T
-
-    if sh_rest_np is not None:
-        for i in range(sh_rest_np.shape[1]):
-            for c in range(3):
-                arr[f"f_rest_{i * 3 + c}"] = sh_rest_np[:, i, c]
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    PlyData([PlyElement.describe(arr, "vertex")], text=False).write(str(path))
-    print(f"[GS] PLY written: {path}  ({N:,} Gaussians)")
