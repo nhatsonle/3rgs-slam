@@ -459,9 +459,15 @@ def _apply_mask_params(
 
 
 def _visibility_from_meta(meta: dict) -> torch.Tensor:
-    """Extract per-Gaussian visibility (N,) float from rasterization meta."""
-    radii = meta["radii"]                    # (C, N) or (N,)
-    visible = (radii > 0).any(dim=0) if radii.dim() > 1 else (radii > 0)
+    """Extract per-Gaussian visibility (N,) float from rasterization meta.
+
+    gsplat radii shape is (..., C, N, 2) — the last dim holds x/y pixel radii.
+    The standard gsplat idiom is (radii > 0).all(dim=-1) to reduce that dim first.
+    """
+    radii = meta["radii"]                    # (..., C, N, 2) unpacked or (nnz, 2) packed
+    visible = (radii > 0).all(dim=-1)        # (..., C, N) — reduces x/y radii dim
+    while visible.dim() > 1:
+        visible = visible.any(dim=0)         # reduce batch/camera dims → (N,)
     return visible.float()
 
 
