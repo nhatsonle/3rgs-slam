@@ -12,35 +12,36 @@ gaussian_splat:
   enabled: false  # disable offline batch GS
 
   # ── Gaussian budget ───────────────────────────────────────────────────────
-  max_gaussians: 400000        # 1M cap for full sequences (500k too tight)
-  max_gaussians_per_kf: 12000   # per-keyframe insertion cap
+  max_gaussians: 800000
+  max_gaussians_per_kf: 30000
 
   # ── Initialization ────────────────────────────────────────────────────────
-  c_conf_threshold: 0.4       # confidence gate for X_canon → lower = denser
+  c_conf_threshold: 0.45      # confidence gate for X_canon → lower = denser
   disc_z_factor: 0.1            # z-axis = in-plane * 0.1 → proper disc init
-  max_log_scale: -2.5           # cap on largest axis (preserves disc shape via shift-down)
-  min_log_scale: -7.0
-  max_scale_ratio: 8.0          # needle: s1/s2 > 8 → remove (discs s1/s2≈1 are safe)
+  max_log_scale: -3.5           # cap on largest axis (preserves disc shape via shift-down)
+  min_log_scale: -8.0
+  max_scale_ratio: 4.0          # needle: s1/s2 > 4 → remove (discs s1/s2≈1 are safe)
   
   # Confidence-modulated scale: blurry/uncertain regions get larger Gaussians
   # for broader coverage; sharp/high-conf regions keep tight scale for fine detail.
-  scale_conf_boost: 2.5  # low-conf pixels get up to 2.5× larger scale at init
+  scale_conf_boost: 1.0  # disable low-confidence scale boost to avoid blob growth
   scale_conf_gamma: 2.0  # quadratic falloff: only low-conf (<~0.5) regions get boosted
 
   # ── Coarse mapping (Stage 1) ──────────────────────────────────────────────
   window_size: 5                # W most-recent cameras per step
   random_history: 2             # R random historical cameras per step
-  steps_per_keyframe: 200       # more steps → better-initialized Gaussians
-  idle_train_steps: 20          # train while waiting for next keyframe
+  steps_per_keyframe: 80        # Giảm nhẹ để Mapping đuổi kịp Tracking
+  idle_train_steps: 20          # Tận dụng triệt để thời gian chờ frame
 
   # ── Fine refinement (Stage 2) ────────────────────────────────────────────
   n_iters_fine: 5000            # high-quality final refinement
   fine_log_interval: 500
-  fine_prune_thresh: 0.01       # initial floater prune before fine stage
+  fine_prune_thresh: 0.08       # initial floater prune before fine stage
+  fine_lambda_depth: 0.0        # avoid fine-stage depth pulling across Sim3 scale noise
 
   # ── Loss weights (paper Eq.13) ────────────────────────────────────────────
   alpha_rgb: 0.8
-  lambda_iso: 0.1
+  lambda_iso: 3.0
   lambda_depth: 0.1
   depth_min_conf: 0.3
   lambda_ssim: 0.2              # D-SSIM complement improves perceptual quality
@@ -50,7 +51,7 @@ gaussian_splat:
   densify_until_iter: 4000      # must be > n_iters_fine when step counter resets
   densify_interval: 100
   opacity_reset_interval: 999999  # disabled (fine stage also disables)
-  prune_opacity_thresh: 0.005
+  prune_opacity_thresh: 0.01
   grad_thresh: 2.0e-4
 
   # ── Learning rates ────────────────────────────────────────────────────────

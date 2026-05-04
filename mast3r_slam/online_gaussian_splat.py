@@ -138,6 +138,16 @@ class GaussianMapper:
     def _make_optimizers(self) -> dict:
         return _make_splat_optimizers(self.data, self.cfg)
 
+    def _estimate_scene_scale(self) -> float:
+        """Robust scene-scale estimate for gsplat DefaultStrategy thresholds."""
+        means = self.data.get("means")
+        if means is None or means.numel() == 0:
+            return 1.0
+        with torch.no_grad():
+            r = torch.linalg.norm(means.detach(), dim=-1)
+            q95 = torch.quantile(r, 0.95).item()
+        return max(float(q95), 1e-3)
+
     def _get_K(self, cam_idx: int) -> torch.Tensor:
         """Return (1, 3, 3) intrinsic tensor on self.device for cam_idx."""
         """Return (1, 3, 3) intrinsic tensor on self.device for cam_idx."""
@@ -269,7 +279,8 @@ class GaussianMapper:
         max_log_scale = self.cfg.get("max_log_scale", -2.0)
         min_log_scale = self.cfg.get("min_log_scale", -7.0)
         log_scales[:, :2] = log_scales[:, :2].clamp(min=min_log_scale, max=max_log_scale)
-        log_scales[:, 2]  = log_scales[:, 2].clamp(min=min_log_scale)  # z: only floor
+        # Cap z-axis too; allowing unlimited z creates giant splats ("bubbles").
+        log_scales[:, 2]  = log_scales[:, 2].clamp(min=min_log_scale, max=max_log_scale)
 
         # Confidence-modulated scale boost applied IN LOG-SPACE, AFTER the global cap.
         # Low-confidence pixels get a relaxed per-pixel cap so the boost is not erased.
@@ -374,7 +385,9 @@ class GaussianMapper:
                 verbose           = False,
             )
             self.strategy.check_sanity(self.data, self.optimizers)
-            self.strategy_state = self.strategy.initialize_state()
+            self.strategy_state = self.strategy.initialize_state(
+                scene_scale=self._estimate_scene_scale()
+            )
         else:
             self._extend_gaussians(new_gs)
 
@@ -573,6 +586,18 @@ class GaussianMapper:
                 overflow = (max_s - max_log_scale).clamp(min=0.0)         # (N,1) ≥0
                 ls      -= overflow
                 ls.clamp_(min=min_log_scale)
+
+            if self.total_steps % 100 == 0:
+                with torch.no_grad():
+                    s_lin = torch.exp(self.data["scales"].detach())
+                    p50 = torch.quantile(s_lin, 0.50, dim=0).tolist()
+                    p95 = torch.quantile(s_lin, 0.95, dim=0).tolist()
+                    print(
+                        "[OnlineGS][debug] scale p50="
+                        f"({p50[0]:.4f},{p50[1]:.4f},{p50[2]:.4f}) "
+                        "p95="
+                        f"({p95[0]:.4f},{p95[1]:.4f},{p95[2]:.4f})"
+                    )
 
             self.total_steps += 1
             s = self.total_steps

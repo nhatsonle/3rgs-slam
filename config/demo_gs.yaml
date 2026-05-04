@@ -28,8 +28,8 @@ gaussian_splat:
   online_enabled: true
 
   # Gaussian count caps
-  max_gaussians: 500000
-  max_gaussians_per_kf: 30000  # lower per-kf cap so 30+ keyframes fill the budget
+  max_gaussians: 800000
+  max_gaussians_per_kf: 10000  # lower per-kf cap so 30+ keyframes fill the budget
 
   # Confidence / initialization
   c_conf_threshold: 0.6        # higher → filter background floaters at init
@@ -52,8 +52,8 @@ gaussian_splat:
   random_history: 2
 
   # Coarse mapping: more steps → better initialization before fine refinement
-  steps_per_keyframe: 100
-  idle_train_steps: 10
+  steps_per_keyframe: 80        # Giảm nhẹ để Mapping đuổi kịp Tracking
+  idle_train_steps: 20          # Tận dụng triệt để thời gian chờ frame
 
   # Fine refinement iterations after SLAM (Stage 2)
   n_iters_fine: 5000
@@ -83,9 +83,9 @@ gaussian_splat:
   densify_from_iter: 100
   densify_until_iter: 4000  # covers fine iters + some coarse buffer
   densify_interval: 100
-  opacity_reset_interval: 999999  # effectively disabled (fine stage also disables)
-  prune_opacity_thresh: 0.005
-  grad_thresh: 2.0e-4
+  opacity_reset_interval: 3000   #Dọn dẹp hạt rác thường xuyên
+  prune_opacity_thresh: 0.01
+  grad_thresh: 5.0e-4
 
   # Learning rates
   lr_means: 1.6e-4

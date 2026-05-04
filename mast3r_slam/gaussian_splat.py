@@ -480,7 +480,13 @@ def _visibility_from_meta(meta: dict) -> torch.Tensor:
 
 
 def _export_ply(path: Path, params: dict) -> None:
-    """Save Gaussians to PLY using gsplat.export_splats (fixes f_rest channel ordering)."""
+    """Save Gaussians to a GraphDeco/SuperSplat-compatible PLY.
+
+    gsplat's PLY writer stores the tensors exactly as provided. Standard 3DGS
+    PLY viewers expect `scale_*` to be log-scales and `opacity` to be logits,
+    so pass the trainable parameter tensors directly instead of exponentiating
+    scales or sigmoid-ing opacities.
+    """
     from gsplat import export_splats
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -489,9 +495,9 @@ def _export_ply(path: Path, params: dict) -> None:
     shN = sh_rest.detach().cpu() if sh_rest is not None else torch.zeros(N, 0, 3)
     export_splats(
         means     = params["means"].detach().cpu(),
-        scales    = torch.exp(params["scales"]).detach().cpu(),       # actual, not log
+        scales    = params["scales"].detach().cpu(),                  # log-scale for PLY viewers
         quats     = params["quats"].detach().cpu(),
-        opacities = torch.sigmoid(params["opacities"]).detach().cpu(),  # actual, not logit
+        opacities = params["opacities"].detach().cpu(),               # opacity logit for PLY viewers
         sh0       = params["sh_dc"].detach().cpu().unsqueeze(1),      # (N, 1, 3)
         shN       = shN,                                               # (N, K, 3)
         format    = "ply",
