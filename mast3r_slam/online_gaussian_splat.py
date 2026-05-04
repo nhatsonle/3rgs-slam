@@ -78,6 +78,13 @@ def make_keyframe_snapshot(kf_idx: int, frame, use_calib: bool) -> dict:
     Returns:
         Dict suitable for putting into a multiprocessing manager Queue.
     """
+    if use_calib and frame.K is None:
+        raise ValueError(
+            "Cannot create calibrated GS keyframe snapshot without intrinsics K. "
+            "Read the frame from SharedKeyframes after keyframes.set_intrinsics(K), "
+            "or assign frame.K before publishing."
+        )
+
     return {
         "type":      "new_kf",
         "kf_idx":    kf_idx,
@@ -128,6 +135,11 @@ class GaussianMapper:
         self.optimizers:    Optional[Dict[str, object]] = None
         self.strategy:      Optional[object]            = None
         self.strategy_state: Optional[dict]             = None
+        self.app_scales:    Optional[torch.Tensor]      = None  # (N_kf, 3)
+        self.app_biases:    Optional[torch.Tensor]      = None  # (N_kf, 3)
+        self.app_optimizer: Optional[object]            = None
+        self.vis_counts:    Optional[torch.Tensor]      = None
+        self.birth_steps:   Optional[torch.Tensor]      = None
 
         self.n_kf:        int            = 0
         self.total_steps: int            = 0
@@ -137,6 +149,87 @@ class GaussianMapper:
 
     def _make_optimizers(self) -> dict:
         return _make_splat_optimizers(self.data, self.cfg)
+
+    def _reset_mapping_state(self) -> None:
+        self.kf_indices.clear()
+        self.viewmats.clear()
+        self.gt_images.clear()
+        self.depth_maps.clear()
+        self.conf_maps.clear()
+        self.Ks_list.clear()
+        self.data = {k: None for k in PARAM_KEYS}
+        self.optimizers = None
+        self.strategy = None
+        self.strategy_state = None
+        self.app_scales = None
+        self.app_biases = None
+        self.app_optimizer = None
+        self.vis_counts = None
+        self.birth_steps = None
+        self.n_kf = 0
+        self.total_steps = 0
+        self.img_shape = None
+
+    def _rebuild_app_optimizer(self) -> None:
+        if not self.cfg.get("appearance_compensation", False):
+            self.app_optimizer = None
+            return
+        self.app_optimizer = torch.optim.Adam(
+            [
+                {"params": [self.app_scales], "lr": self.cfg.get("app_lr_scale", 1.0e-3)},
+                {"params": [self.app_biases], "lr": self.cfg.get("app_lr_bias", 1.0e-4)},
+            ],
+            betas=(0.9, 0.999),
+        )
+
+    def _append_app_camera(self) -> None:
+        if not self.cfg.get("appearance_compensation", False):
+            return
+        new_scale = torch.ones(1, 3, device=self.device)
+        new_bias = torch.zeros(1, 3, device=self.device)
+        if self.app_scales is None:
+            self.app_scales = new_scale.detach().requires_grad_(True)
+            self.app_biases = new_bias.detach().requires_grad_(True)
+        else:
+            self.app_scales = torch.cat([self.app_scales.detach(), new_scale], dim=0).requires_grad_(True)
+            self.app_biases = torch.cat([self.app_biases.detach(), new_bias], dim=0).requires_grad_(True)
+        self._rebuild_app_optimizer()
+
+    def _sync_visibility_counts(self) -> None:
+        n_gs = self.data["means"].shape[0]
+        if self.vis_counts is None:
+            self.vis_counts = torch.zeros(n_gs, device=self.device, dtype=torch.float32)
+            self.birth_steps = torch.full(
+                (n_gs,), float(self.total_steps), device=self.device, dtype=torch.float32
+            )
+            return
+        old_n = self.vis_counts.shape[0]
+        if old_n == n_gs:
+            return
+        new_counts = torch.zeros(n_gs, device=self.device, dtype=torch.float32)
+        n_copy = min(old_n, n_gs)
+        if n_copy > 0:
+            new_counts[:n_copy] = self.vis_counts[:n_copy]
+        self.vis_counts = new_counts
+        if self.birth_steps is None:
+            self.birth_steps = torch.full(
+                (n_gs,), float(self.total_steps), device=self.device, dtype=torch.float32
+            )
+            return
+        old_birth = self.birth_steps
+        new_birth = torch.full(
+            (n_gs,), float(self.total_steps), device=self.device, dtype=torch.float32
+        )
+        if n_copy > 0:
+            new_birth[:n_copy] = old_birth[:n_copy]
+        self.birth_steps = new_birth
+
+    def _apply_keep_mask(self, keep: torch.Tensor) -> None:
+        _apply_mask_params(self.data, self.optimizers, keep, self.strategy_state)
+        if self.vis_counts is not None and self.vis_counts.shape[0] == keep.shape[0]:
+            self.vis_counts = self.vis_counts[keep]
+        if self.birth_steps is not None and self.birth_steps.shape[0] == keep.shape[0]:
+            self.birth_steps = self.birth_steps[keep]
 
     def _estimate_scene_scale(self) -> float:
         """Robust scene-scale estimate for gsplat DefaultStrategy thresholds."""
@@ -227,6 +320,11 @@ class GaussianMapper:
         H_img, W_img = snap["img_shape"]
 
         # Optionally constrain to calibrated ray (same as save_reconstruction)
+        if self.use_calib and snap["K"] is None:
+            raise ValueError(
+                "Online GS is in calibrated mode, but keyframe snapshot has K=None. "
+                "This would force fallback intrinsics and corrupt Gaussian geometry."
+            )
         if self.use_calib and snap["K"] is not None:
             K_t       = snap["K"].to(device)
             img_shape = torch.tensor([H_img, W_img], device=device, dtype=torch.int)
@@ -364,6 +462,7 @@ class GaussianMapper:
         )
         if self.img_shape is None:
             self.img_shape = snap["img_shape"]
+        self._append_app_camera()
 
         cfg = self.cfg
         if self.data["means"] is None:
@@ -400,9 +499,29 @@ class GaussianMapper:
             ).indices
             bool_keep = torch.zeros(n_total, dtype=torch.bool, device=self.device)
             bool_keep[keep] = True
-            _apply_mask_params(self.data, self.optimizers, bool_keep, self.strategy_state)
+            self._apply_keep_mask(bool_keep)
 
         self.n_kf += 1
+
+    def rebuild_from_shared_keyframes(
+        self,
+        keyframes: SharedKeyframes,
+        threshold: Optional[int] = None,
+    ) -> None:
+        """Re-initialise Gaussians from final SLAM keyframes before fine mapping.
+
+        Online coarse mapping receives early snapshots. By the end of SLAM, the
+        shared keyframes can have better poses and pointmaps. Rebuilding here
+        aligns the GS geometry source with evaluate.save_reconstruction().
+        """
+        n_keyframes = len(keyframes)
+        print(f"[OnlineGS] Rebuilding Gaussians from {n_keyframes} final keyframes ...")
+        self._reset_mapping_state()
+        for kf_idx in range(n_keyframes):
+            snap = make_keyframe_snapshot(kf_idx, keyframes[kf_idx], self.use_calib)
+            self.insert_keyframe(snap, threshold=threshold)
+        n_gs = self.data["means"].shape[0] if self.data["means"] is not None else 0
+        print(f"[OnlineGS] Final-keyframe rebuild initialised {n_gs:,} Gaussians.")
 
     def train_step(
         self,
@@ -478,6 +597,8 @@ class GaussianMapper:
 
             for opt in self.optimizers.values():
                 opt.zero_grad(set_to_none=True)
+            if self.app_optimizer is not None:
+                self.app_optimizer.zero_grad(set_to_none=True)
 
             # SH degree: use sh_rest if available (added at fine-stage start)
             sh_rest = self.data.get("sh_rest")
@@ -514,10 +635,15 @@ class GaussianMapper:
 
             # L_rgb: L1 + optional D-SSIM (paper Eq.10 is pure L1; SSIM improves
             # perceptual quality when lambda_ssim > 0 in config)
-            l_rgb     = (render - gt).abs().mean()
+            render_loss = render
+            if self.app_scales is not None and self.app_biases is not None:
+                ac = self.app_scales[cam_idx].view(1, 1, 3)
+                bc = self.app_biases[cam_idx].view(1, 1, 3)
+                render_loss = (ac * render + bc).clamp(0.0, 1.0)
+            l_rgb     = (render_loss - gt).abs().mean()
             lambda_ssim = cfg.get("lambda_ssim", 0.0)
             if lambda_ssim > 0.0:
-                l_d_ssim = (1.0 - _ssim(render, gt)) / 2.0
+                l_d_ssim = (1.0 - _ssim(render_loss, gt)) / 2.0
                 l_rgb    = (1.0 - lambda_ssim) * l_rgb + lambda_ssim * l_d_ssim
 
             # L_depth: confidence-weighted log-depth L1 (paper Eq.11)
@@ -577,6 +703,8 @@ class GaussianMapper:
                 visible = torch.ones(n_after, dtype=torch.bool, device=self.device)
             for opt in self.optimizers.values():
                 opt.step(visibility=visible)
+            if self.app_optimizer is not None:
+                self.app_optimizer.step()
 
             with torch.no_grad():
                 self.data["quats"].data = F.normalize(self.data["quats"].data, dim=-1)
@@ -586,8 +714,14 @@ class GaussianMapper:
                 overflow = (max_s - max_log_scale).clamp(min=0.0)         # (N,1) ≥0
                 ls      -= overflow
                 ls.clamp_(min=min_log_scale)
+                if self.app_scales is not None:
+                    self.app_scales.data.clamp_(0.2, 5.0)
+                    self.app_biases.data.clamp_(-0.5, 0.5)
 
-            if self.total_steps % 100 == 0:
+                self._sync_visibility_counts()
+                self.vis_counts[: visible.shape[0]] += visible.float()
+
+            if cfg.get("debug_scale_stats", False) and self.total_steps % 100 == 0:
                 with torch.no_grad():
                     s_lin = torch.exp(self.data["scales"].detach())
                     p50 = torch.quantile(s_lin, 0.50, dim=0).tolist()
@@ -618,7 +752,7 @@ class GaussianMapper:
                 needle_mask = needle_ratio > max_scale_ratio
             if needle_mask.any():
                 keep = ~needle_mask
-                _apply_mask_params(self.data, self.optimizers, keep, self.strategy_state)
+                self._apply_keep_mask(keep)
                 # rebuild visibility for new count
                 visible = torch.ones(self.data["means"].shape[0], dtype=torch.bool, device=self.device)
 
@@ -629,7 +763,29 @@ class GaussianMapper:
                 ).indices
                 bool_keep = torch.zeros(self.data["means"].shape[0], dtype=torch.bool, device=self.device)
                 bool_keep[keep_idx] = True
-                _apply_mask_params(self.data, self.optimizers, bool_keep, self.strategy_state)
+                self._apply_keep_mask(bool_keep)
+
+            # Visibility-rate pruning removes floaters that rarely contribute.
+            min_vis_rate = cfg.get("min_vis_rate", 0.0)
+            vis_interval = cfg.get("vis_prune_interval", cfg.get("densify_interval", 100))
+            vis_grace = cfg.get("vis_prune_grace", 3 * cfg.get("densify_interval", 100))
+            if (
+                min_vis_rate > 0.0
+                and self.vis_counts is not None
+                and self.birth_steps is not None
+                and s > vis_grace
+                and s % max(1, int(vis_interval)) == 0
+            ):
+                with torch.no_grad():
+                    age = (float(s) - self.birth_steps).clamp(min=1.0)
+                    vis_rate = self.vis_counts / age
+                    keep = (age < vis_grace) | (vis_rate >= min_vis_rate)
+                if (~keep).any():
+                    print(
+                        f"[OnlineGS] Visibility prune removed {(~keep).sum().item():,} "
+                        f"Gaussians (min_vis_rate={min_vis_rate})"
+                    )
+                    self._apply_keep_mask(keep)
 
         return acc
 
@@ -690,7 +846,7 @@ class GaussianMapper:
         with torch.no_grad():
             prune_mask = torch.sigmoid(self.data["opacities"].detach()) < fine_prune_thresh
         if prune_mask.any():
-            _apply_mask_params(self.data, self.optimizers, ~prune_mask, self.strategy_state)
+            self._apply_keep_mask(~prune_mask)
             print(
                 f"[OnlineGS] Initial prune removed {prune_mask.sum().item():,} floaters → "
                 f"{self.data['means'].shape[0]:,} remaining"
@@ -895,8 +1051,15 @@ def run_online_gs(
         elif etype == "terminate":
             print("[OnlineGS] Terminate received — syncing final poses ...")
             if mapper.n_kf > 0:
-                # Sync globally optimised poses from the now-finished backend
+                # Sync globally optimised poses from the now-finished backend.
                 mapper.sync_poses_from_shared(keyframes)
+                if gs_cfg.get("rebuild_from_final_keyframes", False):
+                    mapper.rebuild_from_shared_keyframes(
+                        keyframes,
+                        threshold=gs_cfg.get("final_max_gaussians_per_kf", None),
+                    )
+                    if gs_cfg.get("save_rebuild_init", True):
+                        mapper.save(Path(save_dir), f"{seq_name}_rebuild_init")
                 n_fine = gs_cfg.get("n_iters_fine", 2000)
                 mapper.run_fine_refinement(n_iters=n_fine)
                 mapper.save(Path(save_dir), seq_name)

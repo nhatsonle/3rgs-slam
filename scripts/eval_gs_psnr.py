@@ -6,6 +6,7 @@ Usage:
     python scripts/eval_gs_psnr.py logs/7scenes/chess1 --calib config/calib.yaml
     python scripts/eval_gs_psnr.py logs/7scenes/chess1 --fx 525 --fy 525 --cx 319.5 --cy 239.5
     python scripts/eval_gs_psnr.py logs/7scenes/chess1 --save-renders renders/ --output-csv results.csv
+    python scripts/eval_gs_psnr.py logs/tum_room --ply logs/tum_room/rgbd_dataset_freiburg1_room_online_gs.ply
 
 The run directory must contain:
     <seq>.txt               — TUM-format trajectory (from SLAM)
@@ -14,7 +15,7 @@ The run directory must contain:
 
 Intrinsics priority:
     1. --fx/fy/cx/cy flags (explicit)
-    2. --calib <yaml> file  (fx, fy, cx, cy keys)
+    2. --calib <yaml> file  (supports fx/fy/cx/cy or width/height/calibration)
     3. fallback: f = max(H, W), cx = W/2, cy = H/2
 """
 
@@ -78,7 +79,10 @@ def _load_ply(ply_path: Path, device: str = "cuda") -> dict:
     if rest_fields:
         n_rest = len(rest_fields) // 3
         rest = np.stack([v[n] for n in rest_fields], axis=1)  # (N, n_rest*3)
-        rest = rest.reshape(-1, n_rest, 3)
+        # gsplat.export_splats writes shN as shN.permute(0, 2, 1).reshape(N, -1),
+        # i.e. channel-major [R coeffs..., G coeffs..., B coeffs...].
+        # Convert it back to the renderer layout (N, n_rest, 3).
+        rest = rest.reshape(-1, 3, n_rest).transpose(0, 2, 1)
         sh_rest = torch.tensor(rest, dtype=torch.float32, device=device)
     else:
         sh_rest = None
@@ -123,11 +127,115 @@ def _load_calib_yaml(path: Path) -> dict:
     import yaml
     with open(path) as f:
         data = yaml.safe_load(f)
+    inherit = data.get("inherit")
+    if inherit is not None:
+        parent = _load_calib_yaml(Path(inherit))
+        data = _deep_merge(parent, data)
+
     # Support both flat keys and nested under 'camera' or 'intrinsics'
     for section in [data, data.get("camera", {}), data.get("intrinsics", {})]:
         if section and "fx" in section:
             return {k: float(section[k]) for k in ("fx", "fy", "cx", "cy")}
-    raise ValueError(f"Could not find fx/fy/cx/cy in {path}")
+
+    if all(k in data for k in ("width", "height", "calibration")):
+        return _calibration_to_frame_intrinsics(
+            data["calibration"], int(data["width"]), int(data["height"])
+        )
+
+    raise ValueError(f"Could not find fx/fy/cx/cy or width/height/calibration in {path}")
+
+
+def _deep_merge(parent: dict, child: dict) -> dict:
+    out = dict(parent)
+    for k, v in child.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _resize_calib_to_frame(fx, fy, cx, cy, W_orig, H_orig, img_size=512) -> dict:
+    """Match mast3r_slam.mast3r_utils.resize_img for size=512."""
+    S = max(W_orig, H_orig)
+    W = int(round(W_orig * img_size / S))
+    H = int(round(H_orig * img_size / S))
+    center_x, center_y = W // 2, H // 2
+    halfw = ((2 * center_x) // 16) * 8
+    halfh = ((2 * center_y) // 16) * 8
+    if W == H:
+        halfh = 3 * halfw / 4
+    crop_w = 2 * halfw
+    crop_h = 2 * halfh
+    half_crop_w = (W - crop_w) / 2.0
+    half_crop_h = (H - crop_h) / 2.0
+    scale_w = W_orig / W
+    scale_h = H_orig / H
+    return {
+        "fx": fx / scale_w,
+        "fy": fy / scale_h,
+        "cx": cx / scale_w - half_crop_w,
+        "cy": cy / scale_h - half_crop_h,
+    }
+
+
+def _calibration_to_frame_intrinsics(calibration, W_orig, H_orig, img_size=512) -> dict:
+    """Match dataloader.Intrinsics.from_calib, including distortion rectification."""
+    fx, fy, cx, cy = [float(v) for v in calibration[:4]]
+    K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+    if len(calibration) > 4:
+        try:
+            import cv2
+            distortion = np.array(calibration[4:], dtype=np.float32)
+            K, _ = cv2.getOptimalNewCameraMatrix(
+                K,
+                distortion,
+                (W_orig, H_orig),
+                0,
+                (W_orig, H_orig),
+                centerPrincipalPoint=True,
+            )
+        except Exception:
+            pass
+    return _resize_calib_to_frame(K[0, 0], K[1, 1], K[0, 2], K[1, 2], W_orig, H_orig, img_size)
+
+
+def _tum_intrinsics_from_seq(seq_name: str) -> dict | None:
+    """Return MASt3R frame-space TUM RGB-D intrinsics when sequence name reveals fr index."""
+    import re
+    m = re.search(r"freiburg(\d+)", seq_name)
+    if m is None:
+        return None
+    idx = int(m.group(1))
+    if idx == 1:
+        calib = [517.3, 516.5, 318.6, 255.3, 0.2624, -0.9531, -0.0054, 0.0026, 1.1633]
+    elif idx == 2:
+        calib = [520.9, 521.0, 325.1, 249.7, 0.2312, -0.7849, -0.0033, -0.0001, 0.9172]
+    elif idx == 3:
+        calib = [535.4, 539.2, 320.1, 247.6]
+    else:
+        return None
+    return _calibration_to_frame_intrinsics(calib, W_orig=640, H_orig=480)
+
+
+def _choose_ply(run_dir: Path, explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit.resolve()
+
+    candidates = sorted(run_dir.glob("*_online_gs.ply")) + sorted(run_dir.glob("*_gs.ply"))
+    if not candidates:
+        raise FileNotFoundError("No *_online_gs.ply or *_gs.ply found in run dir.")
+
+    final_candidates = [
+        p for p in candidates
+        if "_rebuild_init_" not in p.name and "_viewer_fixed" not in p.name
+    ]
+    online_candidates = [p for p in final_candidates if p.name.endswith("_online_gs.ply")]
+    if online_candidates:
+        return online_candidates[0]
+    if final_candidates:
+        return final_candidates[0]
+    return candidates[0]
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -136,6 +244,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate GS PSNR/SSIM for a run directory")
     parser.add_argument("run_dir", type=Path, help="Log directory, e.g. logs/7scenes/chess1")
     parser.add_argument("--device", default="cuda", help="cuda or cpu")
+    parser.add_argument("--ply", type=Path, default=None,
+                        help="Explicit GS PLY path. Overrides automatic selection.")
     parser.add_argument("--max-cams", type=int, default=0,
                         help="Evaluate on at most N cameras (0 = all)")
 
@@ -162,18 +272,18 @@ def main():
 
     # Find trajectory, PLY, keyframe dir
     txt_files = list(run_dir.glob("*.txt"))
-    ply_files = list(run_dir.glob("*_online_gs.ply")) + list(run_dir.glob("*_gs.ply"))
     kf_dirs   = list((run_dir / "keyframes").glob("*")) if (run_dir / "keyframes").exists() else []
 
     if not txt_files:
         print("[ERROR] No .txt trajectory found in run dir."); sys.exit(1)
-    if not ply_files:
-        print("[ERROR] No *_online_gs.ply found in run dir."); sys.exit(1)
     if not kf_dirs:
         print("[ERROR] No keyframes/ subdirectory found."); sys.exit(1)
 
     traj_path = txt_files[0]
-    ply_path  = ply_files[0]
+    try:
+        ply_path = _choose_ply(run_dir, args.ply)
+    except FileNotFoundError as e:
+        print(f"[ERROR] {e}"); sys.exit(1)
     kf_dir    = kf_dirs[0]
 
     print(f"Trajectory : {traj_path.name}")
@@ -235,6 +345,10 @@ def main():
         override_K = _load_calib_yaml(args.calib)
         print(f"Intrinsics : {args.calib.name}  fx={override_K['fx']}  fy={override_K['fy']}  "
               f"cx={override_K['cx']}  cy={override_K['cy']}")
+    elif (tum_K := _tum_intrinsics_from_seq(traj_path.stem)) is not None:
+        override_K = tum_K
+        print(f"Intrinsics : auto TUM {traj_path.stem}  fx={override_K['fx']}  "
+              f"fy={override_K['fy']}  cx={override_K['cx']}  cy={override_K['cy']}")
     else:
         f_fb = float(max(H_ref, W_ref))
         print(f"Intrinsics : fallback  f={f_fb}  cx={W_ref/2.0}  cy={H_ref/2.0}  "

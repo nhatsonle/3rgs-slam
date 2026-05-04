@@ -44,6 +44,8 @@ Each time a keyframe is added, main sends:
 After `backend.join()`:
 - `gs_queue.put({"type": "terminate"})`
 - worker syncs final global-optimized poses
+- when `rebuild_from_final_keyframes: true`, worker rebuilds Gaussian geometry
+  from final `SharedKeyframes` before fine refinement
 - worker runs fine refinement and saves final PLY
 
 ---
@@ -75,9 +77,12 @@ Triggered only on terminate event, after SLAM backend has finished.
 
 Flow:
 1. Sync all camera poses from final shared keyframe poses.
-2. Optional floater prune (`fine_prune_thresh`).
-3. Run `n_iters_fine` full-map refinement.
-4. Save final output map.
+2. Optionally rebuild Gaussian geometry from final shared keyframe pointmaps
+   (`rebuild_from_final_keyframes`). This makes fine mapping use the same
+   calibrated, globally-optimized geometry source as `save_reconstruction`.
+3. Optional floater prune (`fine_prune_thresh`).
+4. Run `n_iters_fine` full-map refinement.
+5. Save final output map.
 
 By default in demo/eval profiles, fine stage often uses `fine_lambda_depth: 0.0`
 to avoid cross-camera depth inconsistency from Sim3 scale mismatch.
@@ -153,6 +158,10 @@ This avoids ~22% focal length error for Kinect-based datasets (7-scenes, TUM-RGB
 ## Evaluation
 
 `scripts/eval_gs_psnr.py` evaluates PSNR/SSIM from a run log directory.
+It ignores debug `*_rebuild_init_online_gs.ply` files by default, supports
+`--ply` for explicit final-map selection, and auto-detects TUM RGB-D intrinsics
+from `freiburg1/2/3` sequence names using the same resize/crop convention as
+the dataloader.
 
 ```bash
 # With calibration (recommended for 7-scenes / TUM)

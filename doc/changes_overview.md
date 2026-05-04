@@ -27,6 +27,7 @@ incremental mapping. For implementation details, see
 | `config/base.yaml` | Modified | Adds online GS controls and defaults under `gaussian_splat` |
 | `config/demo_gs.yaml` | Modified | Demo profile tuned for online GS |
 | `config/eval_gs.yaml` | Modified | Evaluation profile for online GS benchmarks |
+| `scripts/eval_gs_psnr.py` | Modified | Selects final PLY, parses TUM/repo intrinsics, supports explicit `--ply` |
 | `mast3r_slam/gaussian_splat.py` | Existing | Offline batch GS path retained (optional) |
 | `mast3r_slam/backend/src/gn_kernels.cu` | Modified | Build compatibility fix for newer PyTorch |
 
@@ -44,7 +45,10 @@ incremental mapping. For implementation details, see
    - `gs_queue.put(snapshot_event)`
 4. After SLAM loop and `backend.join()`:
    - `gs_queue.put({"type": "terminate"})`
-   - online worker syncs final optimized poses and runs fine refinement
+   - online worker syncs final optimized poses
+   - if `rebuild_from_final_keyframes: true`, it rebuilds Gaussian geometry
+     from final `SharedKeyframes` before fine refinement
+   - it runs fine refinement
 5. Worker writes:
    - `<save_dir>/<seq_name>_online_gs.ply`
 
@@ -65,6 +69,7 @@ Important online fields:
 - `window_size`, `random_history`
 - `steps_per_keyframe`, `idle_train_steps`
 - `max_gaussians`, `max_gaussians_per_kf`
+- `rebuild_from_final_keyframes`, `final_max_gaussians_per_kf`, `save_rebuild_init`
 - `n_iters_fine`, `fine_prune_thresh`, `fine_log_interval`
 - `alpha_rgb`, `lambda_iso`, `lambda_depth`, `lambda_ssim`
 - `disc_z_factor`, `max_log_scale`, `min_log_scale`, `max_scale_ratio`

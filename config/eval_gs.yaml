@@ -12,11 +12,11 @@ gaussian_splat:
   enabled: false  # disable offline batch GS
 
   # ── Gaussian budget ───────────────────────────────────────────────────────
-  max_gaussians: 800000
-  max_gaussians_per_kf: 30000
+  max_gaussians: 2500000
+  max_gaussians_per_kf: 50000
 
   # ── Initialization ────────────────────────────────────────────────────────
-  c_conf_threshold: 0.45      # confidence gate for X_canon → lower = denser
+  c_conf_threshold: 0.3       # confidence gate for X_canon → lower = denser
   disc_z_factor: 0.1            # z-axis = in-plane * 0.1 → proper disc init
   max_log_scale: -3.5           # cap on largest axis (preserves disc shape via shift-down)
   min_log_scale: -8.0
@@ -30,21 +30,24 @@ gaussian_splat:
   # ── Coarse mapping (Stage 1) ──────────────────────────────────────────────
   window_size: 5                # W most-recent cameras per step
   random_history: 2             # R random historical cameras per step
-  steps_per_keyframe: 80        # Giảm nhẹ để Mapping đuổi kịp Tracking
-  idle_train_steps: 20          # Tận dụng triệt để thời gian chờ frame
+  steps_per_keyframe: 200       # more steps → better-initialized Gaussians
+  idle_train_steps: 20          # train while waiting for next keyframe
 
   # ── Fine refinement (Stage 2) ────────────────────────────────────────────
-  n_iters_fine: 5000            # high-quality final refinement
+  n_iters_fine: 10000            # high-quality final refinement
   fine_log_interval: 500
   fine_prune_thresh: 0.08       # initial floater prune before fine stage
-  fine_lambda_depth: 0.0        # avoid fine-stage depth pulling across Sim3 scale noise
+  fine_lambda_depth: 0.1        # enable fine-stage depth term; online loss uses alpha depth mix
+  rebuild_from_final_keyframes: true  # rebuild GS geometry from final SLAM pointmaps
+  save_rebuild_init: true             # debug PLY before fine refinement
+  final_max_gaussians_per_kf: 50000
 
   # ── Loss weights (paper Eq.13) ────────────────────────────────────────────
-  alpha_rgb: 0.8
-  lambda_iso: 3.0
+  alpha_rgb: 0.95
+  lambda_iso: 10.0
   lambda_depth: 0.1
   depth_min_conf: 0.3
-  lambda_ssim: 0.2              # D-SSIM complement improves perceptual quality
+  lambda_ssim: 0.0              # paper loss is pure L1 RGB
 
   # ── Density control ───────────────────────────────────────────────────────
   densify_from_iter: 100
@@ -53,6 +56,16 @@ gaussian_splat:
   opacity_reset_interval: 999999  # disabled (fine stage also disables)
   prune_opacity_thresh: 0.01
   grad_thresh: 2.0e-4
+  min_vis_rate: 0.03
+  vis_prune_interval: 100
+  vis_prune_grace: 300
+
+  # ── Per-camera appearance compensation ───────────────────────────────────
+  # Keep this off for PLY/SuperSplat/standalone PSNR evaluation: the affine
+  # camera parameters are not represented in the exported 3DGS PLY.
+  appearance_compensation: false
+  app_lr_scale: 1.0e-3
+  app_lr_bias: 1.0e-4
 
   # ── Learning rates ────────────────────────────────────────────────────────
   lr_means: 1.6e-4

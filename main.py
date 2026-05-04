@@ -280,6 +280,8 @@ if __name__ == "__main__":
             else states.get_frame().T_WC
         )
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+        if use_calib:
+            frame.K = K
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
@@ -291,7 +293,8 @@ if __name__ == "__main__":
             states.set_frame(frame)
             # Publish new keyframe to online GS worker
             if gs_queue is not None:
-                gs_queue.put(make_keyframe_snapshot(len(keyframes) - 1, frame, use_calib))
+                kf_idx = len(keyframes) - 1
+                gs_queue.put(make_keyframe_snapshot(kf_idx, keyframes[kf_idx], use_calib))
             realtime_poses.append(frame.T_WC.data.detach().cpu().clone())
             i += 1
             continue
@@ -325,7 +328,8 @@ if __name__ == "__main__":
             states.queue_global_optimization(len(keyframes) - 1)
             # Publish new keyframe to online GS worker
             if gs_queue is not None:
-                gs_queue.put(make_keyframe_snapshot(len(keyframes) - 1, frame, use_calib))
+                kf_idx = len(keyframes) - 1
+                gs_queue.put(make_keyframe_snapshot(kf_idx, keyframes[kf_idx], use_calib))
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
                 with states.lock:

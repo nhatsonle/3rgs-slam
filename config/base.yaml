@@ -62,7 +62,7 @@ gaussian_splat:
   enabled: false
   # Confidence gate for Gaussian initialisation (0–1).
   # Raise to create fewer Gaussians; lower for denser coverage.
-  c_conf_threshold: 0.5
+  c_conf_threshold: 0.3
   # Hard cap on total Gaussians — primary guard against memory blowup.
   max_gaussians: 2000000
   # Training
