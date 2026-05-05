@@ -21,7 +21,7 @@ tracking:
   rel_error: 1e-3
   delta_norm: 1e-3
   huber: 1.345
-  match_frac_thresh: 0.55
+  match_frac_thresh: 0.6
   sigma_ray: 0.003
   sigma_dist: 1e+1
   sigma_pixel: 1.0
@@ -87,6 +87,10 @@ gaussian_splat:
 
   # ── Online incremental reconstruction (MASt3R-GS paper mode) ─────────────
   online_enabled: false
+  # Online mapper implementation:
+  #   standard  = MASt3R-GS-style free 3D Gaussian mapper
+  #   view_tied = VTGaussian-style mapper tied to MASt3R pointmap pixels
+  mapper_type: standard
   # Sliding window: W most-recent + R random historical cameras per step
   window_size: 5
   random_history: 2
@@ -130,3 +134,29 @@ gaussian_splat:
   appearance_compensation: false
   app_lr_scale: 1.0e-3   # Adam lr for scale (ac) parameters
   app_lr_bias:  1.0e-4   # Adam lr for bias (bc) parameters
+
+  # ── View-tied Gaussian mapper controls (mapper_type: view_tied) ───────────
+  vt_section_size: 8
+  vt_head_insert_cap: 120000
+  vt_regular_insert_cap: 60000
+  vt_max_section_gaussians: 500000
+  vt_silhouette_thresh: 0.2
+  vt_depth_cover_tol: 0.05
+  vt_overlap_depth_tol: 0.05
+  vt_overlap_sample_cap: 5000
+  vt_min_depth: 1.0e-3
+  vt_min_radius: 1.0e-5
+  vt_max_radius: 0.20
+  vt_steps_head: 300
+  vt_steps_regular: 80
+  vt_steps_idle: 20
+  vt_n_iters_fine: 2000
+  vt_lambda_rgb: 1.0
+  vt_lambda_depth: 0.1
+  vt_lambda_ssim: 0.2
+  vt_rgb_alpha_min: 1.0e-4
+  vt_lr_color: 2.5e-3
+  vt_lr_radius: 5.0e-3
+  vt_lr_opacity: 5.0e-2
+  vt_sync_every_idle: 10
+  vt_rebuild_from_final_keyframes: true

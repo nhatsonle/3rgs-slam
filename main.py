@@ -21,6 +21,7 @@ from mast3r_slam.mast3r_utils import (
 )
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.online_gaussian_splat import make_keyframe_snapshot, run_online_gs
+from mast3r_slam.view_tied_gaussian_splat import run_online_vtgs
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
@@ -219,6 +220,13 @@ if __name__ == "__main__":
             traj_file.unlink()
         if recon_file.exists():
             recon_file.unlink()
+        for gs_file in (
+            save_dir / f"{seq_name}_online_gs.ply",
+            save_dir / f"{seq_name}_vtgs_online_gs.ply",
+            save_dir / f"{seq_name}_vtgs.pt",
+        ):
+            if gs_file.exists():
+                gs_file.unlink()
 
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
@@ -235,13 +243,16 @@ if __name__ == "__main__":
     gs_backend  = None
     if online_gs_active:
         save_dir_gs, seq_name_gs = eval.prepare_savedir(args, dataset)
+        gs_cfg = config.get("gaussian_splat", {})
+        mapper_type = gs_cfg.get("mapper_type", "standard")
+        gs_worker = run_online_vtgs if mapper_type == "view_tied" else run_online_gs
         gs_queue   = manager.Queue()
         gs_backend = mp.Process(
-            target=run_online_gs,
+            target=gs_worker,
             args=(config, states, keyframes, str(save_dir_gs), seq_name_gs, gs_queue),
         )
         gs_backend.start()
-        print("[Main] Online GS worker started.")
+        print(f"[Main] Online GS worker started ({mapper_type}).")
 
     i = 0
     fps_timer = time.time()

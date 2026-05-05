@@ -1,0 +1,30 @@
+inherit: "config/eval_gs.yaml"
+
+gaussian_splat:
+  # Use the VTGaussian-style mapper while retaining the same SLAM/eval settings.
+  mapper_type: view_tied
+  online_enabled: true
+  enabled: false
+
+  # View-tied sections: dense local maps, frozen old sections.
+  vt_section_size: 8
+  vt_head_insert_cap: 120000
+  vt_regular_insert_cap: 60000
+  vt_max_section_gaussians: 500000
+
+  # Coverage and overlap tests for regular-frame insertion / context selection.
+  vt_silhouette_thresh: 0.2
+  vt_depth_cover_tol: 0.05
+  vt_overlap_depth_tol: 0.05
+
+  # VT training schedule.
+  vt_steps_head: 300
+  vt_steps_regular: 80
+  vt_steps_idle: 20
+  vt_n_iters_fine: 10000
+  vt_rebuild_from_final_keyframes: true
+
+  # VT loss weights.
+  vt_lambda_rgb: 1.0
+  vt_lambda_depth: 0.1
+  vt_lambda_ssim: 0.2
